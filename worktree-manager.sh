@@ -93,10 +93,12 @@ init_worktree_structure() {
     fi
 
     # Must be in the root of the repository (not a subdirectory)
+    # Both sides are resolved with -P so a symlink component in the cwd
+    # (e.g. macOS /tmp -> /private/tmp) doesn't cause a false mismatch.
     local git_root
     git_root=$(git rev-parse --show-toplevel)
     local current_dir
-    current_dir=$(pwd)
+    current_dir=$(pwd -P)
 
     if [ "$git_root" != "$current_dir" ]; then
         error "Must run --init from the repository root: $git_root"
@@ -135,6 +137,20 @@ init_worktree_structure() {
         error "Initialization cancelled"
     fi
 
+    # `git clone --bare` from a local path points the new repo's remotes at
+    # that local path, not at the original upstream URLs. Capture the real
+    # URLs now so they can be restored after the clone.
+    local remote_names
+    remote_names=$(git remote)
+    local remote_backup=()
+    local remote
+    for remote in $remote_names; do
+        local fetch_url push_url
+        fetch_url=$(git remote get-url "$remote")
+        push_url=$(git remote get-url --push "$remote" 2>/dev/null || echo "$fetch_url")
+        remote_backup+=("${remote}|${fetch_url}|${push_url}")
+    done
+
     # Create a temporary directory for the bare repository
     local temp_bare="${parent_dir}/.${repo_name}.bare.$$"
 
@@ -157,9 +173,27 @@ init_worktree_structure() {
     # Move bare repo into final location
     mv "$temp_bare" "${current_dir}/.git"
 
+    # Restore the real remote URLs (the bare clone pointed them at the
+    # now-obsolete local path instead)
+    for entry in "${remote_backup[@]}"; do
+        IFS='|' read -r remote fetch_url push_url <<< "$entry"
+        git -C "${current_dir}/.git" remote set-url "$remote" "$fetch_url"
+        if [ "$push_url" != "$fetch_url" ]; then
+            git -C "${current_dir}/.git" remote set-url --push "$remote" "$push_url"
+        fi
+    done
+
     # Now add the first worktree from the final location
     info "Creating main worktree..."
     git -C "${current_dir}/.git" worktree add "${current_dir}/${main_dir_name}" "$current_branch"
+
+    # A bare clone copies branches directly into refs/heads rather than as
+    # remote-tracking branches, so upstream tracking is never set up. Restore
+    # it for the main branch if origin is one of the restored remotes.
+    if git -C "${current_dir}/.git" remote get-url origin >/dev/null 2>&1; then
+        git -C "${current_dir}/${main_dir_name}" config "branch.${current_branch}.remote" origin
+        git -C "${current_dir}/${main_dir_name}" config "branch.${current_branch}.merge" "refs/heads/${current_branch}"
+    fi
 
     # Clean up old directory
     rm -rf "${current_dir}.old"
