@@ -28,6 +28,14 @@
 
 set -e
 
+# Command substitutions run in a subshell that does NOT inherit errexit
+# unless this is enabled (bash >= 4.4; macOS system bash is 3.2 and lacks
+# this option, hence the guard). Without it, a failing command inside a
+# function called as `x=$(fn ...)` silently falls through to the rest of
+# that function instead of aborting - which is why the explicit `|| error`
+# checks below don't rely on this alone.
+shopt -s inherit_errexit 2>/dev/null || true
+
 # Colors for output
 RED='\033[0;31m'
 GREEN='\033[0;32m'
@@ -50,15 +58,15 @@ error() {
 }
 
 info() {
-    echo -e "${BLUE}$1${NC}"
+    echo -e "${BLUE}$1${NC}" >&2
 }
 
 success() {
-    echo -e "${GREEN}✓${NC} $1"
+    echo -e "${GREEN}✓${NC} $1" >&2
 }
 
 warning() {
-    echo -e "${YELLOW}⚠${NC} $1"
+    echo -e "${YELLOW}⚠${NC} $1" >&2
 }
 
 # Check if a file/directory is tracked by git
@@ -211,12 +219,35 @@ init_worktree_structure() {
 }
 
 # Find the main worktree directory
+#
+# `git worktree list` always lists the bare repo itself first once a repo has
+# been converted via --init, so the naive "head -1" picks the bare container
+# (no checked-out files) instead of an actual worktree. Skip bare entries.
+# Also skip "prunable" entries - git flags these when a worktree's directory
+# was deleted directly (e.g. `rm -rf`) instead of via `git worktree remove`,
+# leaving orphaned metadata that would otherwise get picked as the "main"
+# worktree despite pointing at a directory that no longer exists.
 find_main_worktree() {
-    local git_common_dir
-    git_common_dir=$(git rev-parse --git-common-dir 2>/dev/null) || error "Not in a git repository"
+    git rev-parse --git-dir >/dev/null 2>&1 || error "Not in a git repository"
 
-    # Get the main worktree path from git worktree list
-    git worktree list | head -1 | awk '{print $1}'
+    local stale_count
+    stale_count=$(git worktree list --porcelain | grep -c '^prunable' || true)
+    if [ "$stale_count" -gt 0 ]; then
+        warning "Found ${stale_count} stale worktree entr$([ "$stale_count" -eq 1 ] && echo y || echo ies) (directory removed without 'git worktree remove'). Run 'git worktree prune' to clean up."
+    fi
+
+    git worktree list --porcelain | awk '
+        /^worktree / { path = substr($0, 10); bare = 0; prunable = 0 }
+        /^bare$/ { bare = 1 }
+        /^prunable/ { prunable = 1 }
+        /^$/ {
+            if (path != "" && !bare && !prunable && !found) { print path; found = 1 }
+            path = ""
+        }
+        END {
+            if (path != "" && !bare && !prunable && !found) print path
+        }
+    '
 }
 
 # Validate that we're in a worktree-enabled repository
@@ -238,7 +269,7 @@ detect_primary_branch() {
 
     # Try to detect from current branch of main worktree
     local current_branch
-    current_branch=$(git -C "$main_worktree" rev-parse --abbrev-ref HEAD 2>/dev/null)
+    current_branch=$(git -C "$main_worktree" rev-parse --abbrev-ref HEAD 2>/dev/null) || true
 
     # Check if it's one of the common primary branch names
     if [[ "$current_branch" =~ ^(main|master|development)$ ]]; then
@@ -254,7 +285,12 @@ detect_primary_branch() {
         fi
     done
 
-    # Fallback to current branch
+    # Fallback to current branch - but if HEAD lookup itself failed and no
+    # standard primary branch exists either, there's nothing usable to base
+    # a new worktree's branch on, so fail loudly instead of handing back "".
+    if [ -z "$current_branch" ]; then
+        error "Could not determine a base branch for worktree at '$main_worktree' (HEAD lookup failed and none of main/master/development exist)"
+    fi
     echo "$current_branch"
 }
 
@@ -440,9 +476,12 @@ create_or_use_worktree() {
 
     local worktree_path="${project_root}/${dir_name}"
 
-    # Check branch/worktree existence
+    # Check branch/worktree existence. check_branch_exists legitimately
+    # returns 1 for the "none" status (branch doesn't exist yet) - under
+    # set -e, capturing that via a bare assignment would kill the script
+    # right here, which is exactly the common case of creating a new branch.
     local branch_status
-    branch_status=$(check_branch_exists "$branch_name")
+    branch_status=$(check_branch_exists "$branch_name") || true
 
     case "$branch_status" in
         worktree)
@@ -450,7 +489,7 @@ create_or_use_worktree() {
             local existing_path
             existing_path=$(find_existing_worktree "$branch_name")
             info "Worktree already exists for branch '$branch_name'"
-            echo -e "${CYAN}Location:${NC} ${existing_path}"
+            echo -e "${CYAN}Location:${NC} ${existing_path}" >&2
             echo "$existing_path"
             is_new_worktree=false
             return 0
@@ -458,19 +497,28 @@ create_or_use_worktree() {
         local)
             # Branch exists locally, create worktree from it
             info "Branch '$branch_name' exists locally, creating worktree..."
-            git worktree add "$worktree_path" "$branch_name"
+            git worktree add "$worktree_path" "$branch_name" 1>&2 \
+                || error "git worktree add failed for branch '$branch_name'"
             ;;
         remote)
             # Branch exists on remote, check it out
             info "Branch '$branch_name' exists on remote, creating worktree..."
-            git worktree add "$worktree_path" -b "$branch_name" "origin/$branch_name"
+            git worktree add "$worktree_path" -b "$branch_name" "origin/$branch_name" 1>&2 \
+                || error "git worktree add failed for branch '$branch_name' from 'origin/$branch_name'"
             ;;
         none)
             # Create new branch
             info "Creating new branch '$branch_name' from '$base_branch'..."
-            git worktree add "$worktree_path" -b "$branch_name" "$base_branch"
+            git worktree add "$worktree_path" -b "$branch_name" "$base_branch" 1>&2 \
+                || error "git worktree add failed for new branch '$branch_name' from '$base_branch'"
             ;;
     esac
+
+    # git worktree add can print a fatal error yet still be masked by callers
+    # capturing this function's output via command substitution (see the
+    # inherit_errexit note near the top) - so don't trust its exit status
+    # alone, confirm the directory actually exists before declaring success.
+    [ -d "$worktree_path" ] || error "Worktree directory was not created: $worktree_path"
 
     success "Worktree ready"
     echo "$worktree_path"
@@ -639,9 +687,10 @@ main() {
         info "Branch name: ${branch_name}"
     fi
 
-    # Check if worktree already exists
+    # Check if worktree already exists (see the note on check_branch_exists's
+    # "none" return status in create_or_use_worktree for why `|| true` matters)
     local branch_status
-    branch_status=$(check_branch_exists "$branch_name")
+    branch_status=$(check_branch_exists "$branch_name") || true
 
     local worktree_path
     local is_existing=false
