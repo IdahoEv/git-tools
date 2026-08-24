@@ -536,20 +536,28 @@ symlink_configuration() {
 
     local symlinked=0
 
-    # Symlink .env* files
-    for envfile in "$main_worktree"/.env*; do
-        [ -f "$envfile" ] || continue
-
-        local basename
-        basename="$(basename "$envfile")"
-
-        # Check if it's tracked
-        if ! is_tracked "$envfile"; then
-            ln -s "$envfile" "$worktree_path/$basename"
-            success "Symlinked $basename"
-            ((symlinked++))
-        fi
-    done
+    # Symlink gitignored .env* files from anywhere in the main worktree.
+    # A root-only glob ("$main_worktree"/.env*) misses nested secrets like
+    # src/apps/frontend/.env.local, so use git's own ignored-file list to
+    # find every .env* at any depth and mirror each into the same relative
+    # path in the new worktree. --ignored guarantees these are untracked,
+    # so no separate is_tracked check is needed. Symlinking (rather than
+    # copying) keeps a single source of truth: rotating a secret updates
+    # every worktree at once with no drift.
+    local envfiles
+    envfiles=$(git -C "$main_worktree" ls-files --others --ignored --exclude-standard -- '.env*' '**/.env*' 2>/dev/null || true)
+    if [ -n "$envfiles" ]; then
+        local relpath src dst
+        while IFS= read -r relpath; do
+            [ -n "$relpath" ] || continue
+            src="$main_worktree/$relpath"
+            dst="$worktree_path/$relpath"
+            mkdir -p "$(dirname "$dst")"
+            ln -s "$src" "$dst"
+            success "Symlinked $relpath"
+            symlinked=$((symlinked + 1))
+        done <<< "$envfiles"
+    fi
 
     # Check .claude directory
     if [ -d "$main_worktree/.claude" ]; then
@@ -557,7 +565,7 @@ symlink_configuration() {
             # Entire directory is untracked, symlink it
             ln -s "$main_worktree/.claude" "$worktree_path/.claude"
             success "Symlinked .claude/"
-            ((symlinked++))
+            symlinked=$((symlinked + 1))
         else
             # Directory is tracked, but check for settings.local.json
             if [ -f "$main_worktree/.claude/settings.local.json" ]; then
@@ -565,7 +573,7 @@ symlink_configuration() {
                     mkdir -p "$worktree_path/.claude"
                     ln -s "$main_worktree/.claude/settings.local.json" "$worktree_path/.claude/settings.local.json"
                     success "Symlinked .claude/settings.local.json"
-                    ((symlinked++))
+                    symlinked=$((symlinked + 1))
                 fi
             fi
         fi
@@ -576,7 +584,7 @@ symlink_configuration() {
         mkdir -p "$worktree_path/docs"
         ln -s "$main_worktree/docs/local" "$worktree_path/docs/local"
         success "Symlinked docs/local/"
-        ((symlinked++))
+        symlinked=$((symlinked + 1))
     fi
 
     if [ $symlinked -eq 0 ]; then
@@ -618,6 +626,47 @@ install_dependencies() {
 }
 
 # ============================================================================
+# Help
+# ============================================================================
+
+show_help() {
+    cat <<EOF
+worktree-manager.sh - Create and configure git worktrees with automatic setup
+
+Usage:
+  worktree-manager.sh --init                             Convert regular repo to worktree structure
+  worktree-manager.sh [--claude]                         Interactive mode: select branch with fzf
+  worktree-manager.sh [--claude] <branch-name>           Create worktree with arbitrary branch name
+  worktree-manager.sh [--claude] --sc <ticket-id>        Create worktree from Shortcut ticket
+  worktree-manager.sh --help                             Show this help message
+
+Aliases (when shell module is loaded):
+  wm          worktree-manager.sh
+  wms         worktree-manager.sh --sc
+  wmc         worktree-manager.sh --claude
+  wmsc        worktree-manager.sh --claude --sc
+
+Options:
+  --init          Convert a regular git repository into worktree structure
+  --claude        Open Claude Code in the worktree after setup
+  --sc <id>       Use Shortcut ticket ID to fetch branch name and details
+  --help, -h      Show this help message
+
+Examples:
+  wm --init                   Initialize worktree structure (run in repo root)
+  wm                          Interactive: select from branches/worktrees
+  wmc                         Interactive + open Claude
+  wm feature/add-login        Create specific branch
+  wms 65682                   Create from Shortcut ticket
+  wmsc 65682                  Shortcut + open Claude
+
+Removing a worktree (not handled by this script):
+  git worktree remove <path>
+  git branch -d <branch-name>
+EOF
+}
+
+# ============================================================================
 # Main
 # ============================================================================
 
@@ -633,6 +682,12 @@ main() {
         # No arguments - enter interactive mode
         interactive_mode=true
     else
+        # Check for --help/-h first so it works regardless of other flags
+        if [ "$1" = "--help" ] || [ "$1" = "-h" ]; then
+            show_help
+            exit 0
+        fi
+
         # Check for --init flag first
         if [ "$1" = "--init" ]; then
             init_worktree_structure
