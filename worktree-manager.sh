@@ -227,6 +227,14 @@ init_worktree_structure() {
 # was deleted directly (e.g. `rm -rf`) instead of via `git worktree remove`,
 # leaving orphaned metadata that would otherwise get picked as the "main"
 # worktree despite pointing at a directory that no longer exists.
+#
+# Among the remaining real worktrees, prefer the one checked out on the repo's
+# primary branch (main/master/development): that root is where per-project
+# config lives (.worktree-sync, an untracked .claude/, docs/local/), and it is
+# also the correct base for new branches. `git worktree list` orders entries by
+# creation time, not by branch, so the first real worktree is often a feature
+# branch. Fall back to that first entry only when none of the primary branches
+# is checked out anywhere.
 find_main_worktree() {
     git rev-parse --git-dir >/dev/null 2>&1 || error "Not in a git repository"
 
@@ -237,16 +245,16 @@ find_main_worktree() {
     fi
 
     git worktree list --porcelain | awk '
-        /^worktree / { path = substr($0, 10); bare = 0; prunable = 0 }
+        function flush() {
+            if (path == "" || bare || prunable) return
+            if (first == "") first = path
+            if (primary == "" && (branch == "refs/heads/main" || branch == "refs/heads/master" || branch == "refs/heads/development")) primary = path
+        }
+        /^worktree / { flush(); path = substr($0, 10); bare = 0; prunable = 0; branch = "" }
         /^bare$/ { bare = 1 }
         /^prunable/ { prunable = 1 }
-        /^$/ {
-            if (path != "" && !bare && !prunable && !found) { print path; found = 1 }
-            path = ""
-        }
-        END {
-            if (path != "" && !bare && !prunable && !found) print path
-        }
+        /^branch / { branch = substr($0, 8) }
+        END { flush(); print (primary != "" ? primary : first) }
     '
 }
 
@@ -525,70 +533,155 @@ create_or_use_worktree() {
 }
 
 # ============================================================================
-# Configuration Symlinking
+# Configuration Sync (symlink / copy of gitignored paths)
 # ============================================================================
 
-symlink_configuration() {
+# Paths seeded into every new worktree regardless of project. Each entry is a
+# directive in the same format as the per-project manifest (see below):
+#   <link|copy> <relative-path> [--exclude <subpath>]...
+WORKTREE_SYNC_DEFAULTS=(
+    "link docs/local/"
+)
+
+# Per-project manifest, read from the main worktree root if present. Lets a
+# repo declare extra gitignored paths to seed into new worktrees (build caches,
+# tool state) without hardcoding anything project-specific in this script.
+# Format, one directive per line, '#' starts a comment:
+#   link  <path>              symlink (single source of truth; secrets, shared config)
+#   copy  <path> [--exclude s] rsync a private copy (per-branch caches; mono dirs, etc.)
+WORKTREE_SYNC_FILE=".worktree-sync"
+
+# Sync one gitignored path from the main worktree into the new worktree at the
+# same relative location. Reads $main_worktree / $worktree_path / $synced from
+# the caller's scope (bash dynamic scoping). Returns without acting if the
+# source is missing, is tracked by git, or the destination already exists.
+#   sync_path <link|copy> <relpath> [--exclude <subpath>]...
+sync_path() {
+    local mode="$1" relpath="$2"
+    shift 2
+
+    # Normalize: drop any trailing slashes so dirname/ln/rsync behave.
+    while [ "${relpath%/}" != "$relpath" ]; do relpath="${relpath%/}"; done
+
+    local excludes=()
+    while [ $# -gt 0 ]; do
+        case "$1" in
+            --exclude) excludes+=("$2"); shift 2 ;;
+            *) warning "sync_path: ignoring unknown argument '$1'"; shift ;;
+        esac
+    done
+
+    local src="$main_worktree/$relpath"
+    local dst="$worktree_path/$relpath"
+
+    [ -e "$src" ] || return 0
+
+    # Never shadow a version-controlled file with a symlink/copy.
+    if is_tracked "$src"; then
+        warning "Skipping '$relpath' (tracked by git)"
+        return 0
+    fi
+
+    # Respect anything git already placed in the new worktree.
+    if [ -e "$dst" ] || [ -L "$dst" ]; then
+        return 0
+    fi
+
+    mkdir -p "$(dirname "$dst")"
+
+    case "$mode" in
+        link)
+            ln -s "$src" "$dst"
+            success "Symlinked $relpath"
+            ;;
+        copy)
+            if [ -d "$src" ]; then
+                local rsync_args=(-a) ex
+                for ex in "${excludes[@]}"; do
+                    rsync_args+=(--exclude "$ex")
+                done
+                # Trailing slashes: copy the directory's contents into dst.
+                rsync "${rsync_args[@]}" "$src/" "$dst/"
+            else
+                cp -p "$src" "$dst"
+            fi
+            if [ ${#excludes[@]} -gt 0 ]; then
+                success "Copied $relpath (excluding ${excludes[*]})"
+            else
+                success "Copied $relpath"
+            fi
+            ;;
+        *)
+            warning "sync_path: unknown mode '$mode' for '$relpath'"
+            return 0
+            ;;
+    esac
+
+    synced=$((synced + 1))
+}
+
+# Emit the per-project sync manifest (if any) one directive per line, with
+# comments and blank lines stripped.
+read_sync_manifest() {
+    local manifest="$main_worktree/$WORKTREE_SYNC_FILE"
+    [ -f "$manifest" ] || return 0
+
+    local line
+    while IFS= read -r line || [ -n "$line" ]; do
+        line="${line%%#*}"
+        # Trim surrounding whitespace.
+        line="${line#"${line%%[![:space:]]*}"}"
+        line="${line%"${line##*[![:space:]]}"}"
+        [ -n "$line" ] || continue
+        echo "$line"
+    done < "$manifest"
+}
+
+sync_configuration() {
     local main_worktree="$1"
     local worktree_path="$2"
 
     info "Setting up configuration..."
 
-    local symlinked=0
+    local synced=0
 
-    # Symlink gitignored .env* files from anywhere in the main worktree.
-    # A root-only glob ("$main_worktree"/.env*) misses nested secrets like
-    # src/apps/frontend/.env.local, so use git's own ignored-file list to
-    # find every .env* at any depth and mirror each into the same relative
-    # path in the new worktree. --ignored guarantees these are untracked,
-    # so no separate is_tracked check is needed. Symlinking (rather than
-    # copying) keeps a single source of truth: rotating a secret updates
-    # every worktree at once with no drift.
+    # .env* files, discovered via git's own ignored-file list so nested secrets
+    # (src/apps/frontend/.env.local) are caught too. Always symlinked so
+    # rotating a secret updates every worktree at once with no drift.
     local envfiles
     envfiles=$(git -C "$main_worktree" ls-files --others --ignored --exclude-standard -- '.env*' '**/.env*' 2>/dev/null || true)
     if [ -n "$envfiles" ]; then
-        local relpath src dst
+        local relpath
         while IFS= read -r relpath; do
             [ -n "$relpath" ] || continue
-            src="$main_worktree/$relpath"
-            dst="$worktree_path/$relpath"
-            mkdir -p "$(dirname "$dst")"
-            ln -s "$src" "$dst"
-            success "Symlinked $relpath"
-            symlinked=$((symlinked + 1))
+            sync_path link "$relpath"
         done <<< "$envfiles"
     fi
 
-    # Check .claude directory
+    # .claude/: the whole directory if it's untracked, otherwise just an
+    # untracked settings.local.json inside a tracked directory.
     if [ -d "$main_worktree/.claude" ]; then
         if ! is_tracked "$main_worktree/.claude"; then
-            # Entire directory is untracked, symlink it
-            ln -s "$main_worktree/.claude" "$worktree_path/.claude"
-            success "Symlinked .claude/"
-            symlinked=$((symlinked + 1))
-        else
-            # Directory is tracked, but check for settings.local.json
-            if [ -f "$main_worktree/.claude/settings.local.json" ]; then
-                if ! is_tracked "$main_worktree/.claude/settings.local.json"; then
-                    mkdir -p "$worktree_path/.claude"
-                    ln -s "$main_worktree/.claude/settings.local.json" "$worktree_path/.claude/settings.local.json"
-                    success "Symlinked .claude/settings.local.json"
-                    symlinked=$((symlinked + 1))
-                fi
-            fi
+            sync_path link ".claude"
+        elif [ -f "$main_worktree/.claude/settings.local.json" ]; then
+            sync_path link ".claude/settings.local.json"
         fi
     fi
 
-    # Symlink docs/local if it exists
-    if [ -d "$main_worktree/docs/local" ]; then
-        mkdir -p "$worktree_path/docs"
-        ln -s "$main_worktree/docs/local" "$worktree_path/docs/local"
-        success "Symlinked docs/local/"
-        symlinked=$((symlinked + 1))
-    fi
+    # Built-in defaults, then any per-project .worktree-sync directives. Each
+    # line is deliberately word-split into (mode, path, flags) for sync_path.
+    local directive
+    while IFS= read -r directive; do
+        [ -n "$directive" ] || continue
+        # shellcheck disable=SC2086
+        sync_path $directive
+    done < <(
+        printf '%s\n' "${WORKTREE_SYNC_DEFAULTS[@]}"
+        read_sync_manifest
+    )
 
-    if [ $symlinked -eq 0 ]; then
-        warning "No configuration files found to symlink"
+    if [ "$synced" -eq 0 ]; then
+        warning "No configuration files found to sync"
     fi
 }
 
@@ -659,6 +752,13 @@ Examples:
   wm feature/add-login        Create specific branch
   wms 65682                   Create from Shortcut ticket
   wmsc 65682                  Shortcut + open Claude
+
+New worktrees are seeded with gitignored config:
+  .env* and .claude/           symlinked (single source of truth)
+  docs/local/                  symlinked
+  .worktree-sync (repo root)   per-project manifest of extra paths, one directive per line:
+                                 link <path>               symlink it
+                                 copy <path> [--exclude s]  rsync a private per-branch copy
 
 Removing a worktree (not handled by this script):
   git worktree remove <path>
@@ -765,7 +865,7 @@ main() {
         worktree_path=$(create_or_use_worktree "$branch_name" "$base_branch" "$main_worktree")
 
         # Only do setup for newly created worktrees
-        symlink_configuration "$main_worktree" "$worktree_path"
+        sync_configuration "$main_worktree" "$worktree_path"
         install_dependencies "$worktree_path"
 
         # Save ticket details if using Shortcut
