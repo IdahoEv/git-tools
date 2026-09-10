@@ -56,17 +56,12 @@ PROVIDER_DIR="${START_TICKET_PROVIDER_DIR:-$SCRIPT_DIR/start-ticket-providers}"
 #            UNSUBMITTED for review.
 #   bottom — a plain shell in the worktree.
 # The kickoff is also put on the clipboard as a fallback (paste with ⌘V).
-# Tab name = "#<n> <slug>", truncated to START_TICKET_TAB_MAXLEN.
+# Tab name = branch name (already "<n>-<slug>"), truncated to START_TICKET_TAB_MAXLEN.
 open_tab() {  # <worktree> <kickoff>
   local wt="$1" kf="$2"
   local branch; branch="$(git -C "$wt" branch --show-current 2>/dev/null || basename "$wt")"
 
-  local label
-  if [[ "$branch" =~ ^([0-9]+)-(.+)$ ]]; then
-    label="#${BASH_REMATCH[1]} ${BASH_REMATCH[2]}"
-  else
-    label="$branch"
-  fi
+  local label="$branch"
   local maxlen="${START_TICKET_TAB_MAXLEN:-24}"
   [ "${#label}" -gt "$maxlen" ] && label="${label:0:$((maxlen-1))}…"
 
