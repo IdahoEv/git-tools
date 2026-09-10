@@ -69,10 +69,15 @@ warning() {
     echo -e "${YELLOW}⚠${NC} $1" >&2
 }
 
-# Check if a file/directory is tracked by git
+# Check if a file/directory is tracked by git.
+# Callers pass absolute paths under the main worktree, but this script is
+# designed to be run from *any* worktree - so run git against the path's own
+# directory rather than the caller's cwd, which may be an unrelated worktree
+# (where the absolute path reads as "outside repository" and every check would
+# wrongly come back untracked).
 is_tracked() {
     local path="$1"
-    git ls-files --error-unmatch "$path" >/dev/null 2>&1
+    git -C "$(dirname "$path")" ls-files --error-unmatch "$(basename "$path")" >/dev/null 2>&1
 }
 
 # ============================================================================
@@ -203,6 +208,13 @@ init_worktree_structure() {
         git -C "${current_dir}/${main_dir_name}" config "branch.${current_branch}.merge" "refs/heads/${current_branch}"
     fi
 
+    # Record which worktree holds the per-project config. This is stored in the
+    # shared (bare) config, so every worktree sees it. find_main_worktree reads
+    # it first; without it the config root can only be guessed from which
+    # worktree is on the primary branch, which is wrong once this root is
+    # switched to a feature branch.
+    git -C "${current_dir}/${main_dir_name}" config worktreeManager.configRoot "${current_dir}/${main_dir_name}"
+
     # Clean up old directory
     rm -rf "${current_dir}.old"
 
@@ -228,15 +240,26 @@ init_worktree_structure() {
 # leaving orphaned metadata that would otherwise get picked as the "main"
 # worktree despite pointing at a directory that no longer exists.
 #
-# Among the remaining real worktrees, prefer the one checked out on the repo's
-# primary branch (main/master/development): that root is where per-project
-# config lives (.worktree-sync, an untracked .claude/, docs/local/), and it is
-# also the correct base for new branches. `git worktree list` orders entries by
-# creation time, not by branch, so the first real worktree is often a feature
-# branch. Fall back to that first entry only when none of the primary branches
-# is checked out anywhere.
+# The config root recorded at --init time (worktreeManager.configRoot) wins:
+# that is the worktree that actually holds per-project config (.worktree-sync,
+# an untracked .claude/, docs/local/), regardless of what branch it is on now.
+#
+# Repos initialized before that marker existed fall back to the heuristic:
+# among the remaining real worktrees, prefer the one checked out on the repo's
+# primary branch (main/master/development), since that is usually the config
+# root and the right base for new branches. `git worktree list` orders entries
+# by creation time, not by branch, so the first real worktree is often a
+# feature branch. Fall back to that first entry only when none of the primary
+# branches is checked out anywhere.
 find_main_worktree() {
     git rev-parse --git-dir >/dev/null 2>&1 || error "Not in a git repository"
+
+    local config_root
+    config_root=$(git config --get worktreeManager.configRoot 2>/dev/null || true)
+    if [ -n "$config_root" ] && [ -d "$config_root" ]; then
+        echo "$config_root"
+        return
+    fi
 
     local stale_count
     stale_count=$(git worktree list --porcelain | grep -c '^prunable' || true)
@@ -557,6 +580,13 @@ WORKTREE_SYNC_FILE=".worktree-sync"
 # source is missing, is tracked by git, or the destination already exists.
 #   sync_path <link|copy> <relpath> [--exclude <subpath>]...
 sync_path() {
+    # A malformed manifest line (e.g. a lone token) would otherwise make the
+    # `shift 2` below fail, and under `set -e` that aborts the whole run after
+    # the worktree already exists. Skip it with a warning instead.
+    if [ $# -lt 2 ]; then
+        warning "sync_path: ignoring malformed directive '$*' (expected '<link|copy> <path>')"
+        return 0
+    fi
     local mode="$1" relpath="$2"
     shift 2
 
@@ -570,6 +600,13 @@ sync_path() {
             *) warning "sync_path: ignoring unknown argument '$1'"; shift ;;
         esac
     done
+
+    # --exclude only means anything to rsync, i.e. copy mode. Warn rather than
+    # silently pretend a linked tree had a subpath held back.
+    if [ "$mode" != copy ] && [ ${#excludes[@]} -gt 0 ]; then
+        warning "sync_path: --exclude is ignored for '$mode' mode ('$relpath')"
+        excludes=()
+    fi
 
     local src="$main_worktree/$relpath"
     local dst="$worktree_path/$relpath"
