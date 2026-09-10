@@ -569,15 +569,26 @@ WORKTREE_SYNC_DEFAULTS=(
 # Per-project manifest, read from the main worktree root if present. Lets a
 # repo declare extra gitignored paths to seed into new worktrees (build caches,
 # tool state) without hardcoding anything project-specific in this script.
-# Format, one directive per line, '#' starts a comment:
-#   link  <path>              symlink (single source of truth; secrets, shared config)
-#   copy  <path> [--exclude s] rsync a private copy (per-branch caches; mono dirs, etc.)
+# Format, one directive per line, '#' starts a comment. Tokens follow shell
+# quoting, so a path containing spaces goes in quotes:
+#   link  <path>               symlink (single source of truth; secrets, shared config)
+#   copy  <path> [--exclude s]  rsync a private copy (per-branch caches; mono dirs, etc.)
+#   copy  "my build dir"        quote paths with spaces
 WORKTREE_SYNC_FILE=".worktree-sync"
 
+# Split one manifest directive into tokens, honoring shell quoting (so quoted
+# paths with spaces survive). `xargs` does POSIX word-splitting without glob
+# expansion or command substitution; on a quoting error it is skipped upstream.
+tokenize_directive() {  # <directive>  -> one token per line on stdout
+    printf '%s' "$1" | xargs -n1 printf '%s\n' 2>/dev/null
+}
+
 # Sync one gitignored path from the main worktree into the new worktree at the
-# same relative location. Reads $main_worktree / $worktree_path / $synced from
-# the caller's scope (bash dynamic scoping). Returns without acting if the
-# source is missing, is tracked by git, or the destination already exists.
+# same relative location. Reads $main_worktree / $worktree_path / $synced /
+# $failed from the caller's scope (bash dynamic scoping). Returns without acting
+# if the source is missing, is tracked by git, or the destination already
+# exists. A copy/link/mkdir failure is counted in $failed and skipped, never
+# fatal.
 #   sync_path <link|copy> <relpath> [--exclude <subpath>]...
 sync_path() {
     # A malformed manifest line (e.g. a lone token) would otherwise make the
@@ -624,23 +635,41 @@ sync_path() {
         return 0
     fi
 
-    mkdir -p "$(dirname "$dst")"
+    # From here on, a failure is reported and counted but never aborts the run:
+    # the worktree already exists, and the remaining setup (other paths,
+    # dependency install, ticket file) should still get a chance to complete.
+    if ! mkdir -p "$(dirname "$dst")"; then
+        warning "Could not create parent directory for '$relpath' - skipping"
+        failed=$((failed + 1))
+        return 0
+    fi
 
     case "$mode" in
         link)
-            ln -s "$src" "$dst"
-            success "Symlinked $relpath"
+            if ln -s "$src" "$dst"; then
+                success "Symlinked $relpath"
+            else
+                warning "Could not symlink '$relpath' - skipping"
+                failed=$((failed + 1))
+                return 0
+            fi
             ;;
         copy)
+            local ok=1
             if [ -d "$src" ]; then
                 local rsync_args=(-a) ex
                 for ex in "${excludes[@]}"; do
                     rsync_args+=(--exclude "$ex")
                 done
                 # Trailing slashes: copy the directory's contents into dst.
-                rsync "${rsync_args[@]}" "$src/" "$dst/"
+                rsync "${rsync_args[@]}" "$src/" "$dst/" || ok=0
             else
-                cp -p "$src" "$dst"
+                cp -p "$src" "$dst" || ok=0
+            fi
+            if [ "$ok" -eq 0 ]; then
+                warning "Could not copy '$relpath' - skipping"
+                failed=$((failed + 1))
+                return 0
             fi
             if [ ${#excludes[@]} -gt 0 ]; then
                 success "Copied $relpath (excluding ${excludes[*]})"
@@ -681,6 +710,7 @@ sync_configuration() {
     info "Setting up configuration..."
 
     local synced=0
+    local failed=0
 
     # .env* files, discovered via git's own ignored-file list so nested secrets
     # (src/apps/frontend/.env.local) are caught too. Always symlinked so
@@ -706,19 +736,31 @@ sync_configuration() {
     fi
 
     # Built-in defaults, then any per-project .worktree-sync directives. Each
-    # line is deliberately word-split into (mode, path, flags) for sync_path.
+    # line is tokenized (respecting quotes) into (mode, path, flags) for
+    # sync_path.
     local directive
     while IFS= read -r directive; do
         [ -n "$directive" ] || continue
-        # shellcheck disable=SC2086
-        sync_path $directive
+        local parts=() tok
+        while IFS= read -r tok; do
+            parts+=("$tok")
+        done < <(tokenize_directive "$directive")
+        if [ ${#parts[@]} -eq 0 ]; then
+            warning "sync: could not parse manifest line: $directive"
+            failed=$((failed + 1))
+            continue
+        fi
+        sync_path "${parts[@]}"
     done < <(
         printf '%s\n' "${WORKTREE_SYNC_DEFAULTS[@]}"
         read_sync_manifest
     )
 
-    if [ "$synced" -eq 0 ]; then
+    if [ "$synced" -eq 0 ] && [ "$failed" -eq 0 ]; then
         warning "No configuration files found to sync"
+    fi
+    if [ "$failed" -gt 0 ]; then
+        warning "${failed} configuration path(s) could not be synced (see above) - worktree is otherwise ready"
     fi
 }
 
@@ -793,7 +835,8 @@ Examples:
 New worktrees are seeded with gitignored config:
   .env* and .claude/           symlinked (single source of truth)
   docs/local/                  symlinked
-  .worktree-sync (repo root)   per-project manifest of extra paths, one directive per line:
+  .worktree-sync (repo root)   per-project manifest of extra paths, one directive per line
+                               (tokens follow shell quoting; quote paths with spaces):
                                  link <path>               symlink it
                                  copy <path> [--exclude s]  rsync a private per-branch copy
 
