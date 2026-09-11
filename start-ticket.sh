@@ -89,7 +89,7 @@ on run argv
         set topPane to current session
         tell topPane
           set name to tabName
-          write text "cd " & quoted form of wt & " && exec claude"
+          write text "cd " & quoted form of wt & " && claude"
           set botPane to (split horizontally with default profile)
         end tell
         tell botPane
