@@ -56,14 +56,30 @@ PROVIDER_DIR="${START_TICKET_PROVIDER_DIR:-$SCRIPT_DIR/start-ticket-providers}"
 #            UNSUBMITTED for review.
 #   bottom — a plain shell in the worktree.
 # The kickoff is also put on the clipboard as a fallback (paste with ⌘V).
-# Tab name = branch name (already "<n>-<slug>"), truncated to START_TICKET_TAB_MAXLEN.
+# Tab name = "#<n> <slug>" where the ticket number is ALWAYS kept and the slug is
+# truncated instead (to START_TICKET_TAB_MAXLEN). The name is re-asserted after
+# commands are written so iTerm's automatic title updates don't clobber it.
 open_tab() {  # <worktree> <kickoff>
   local wt="$1" kf="$2"
   local branch; branch="$(git -C "$wt" branch --show-current 2>/dev/null || basename "$wt")"
 
-  local label="$branch"
+  # Branch "<n>-<slug>" -> "#<n> <slug>"; keep the number, truncate the slug.
+  local num="" slug="$branch"
+  if [[ "$branch" =~ ^([0-9]+)-(.+)$ ]]; then
+    num="#${BASH_REMATCH[1]}"
+    slug="${BASH_REMATCH[2]}"
+  fi
   local maxlen="${START_TICKET_TAB_MAXLEN:-24}"
-  [ "${#label}" -gt "$maxlen" ] && label="${label:0:$((maxlen-1))}…"
+  local label
+  if [ -n "$num" ]; then
+    # Reserve room for "#N " and the ellipsis when truncating the slug.
+    local budget=$((maxlen - ${#num} - 2))
+    [ "${#slug}" -gt "$budget" ] && slug="${slug:0:$((budget-1))}…"
+    label="$num $slug"
+  else
+    [ "${#slug}" -gt "$maxlen" ] && slug="${slug:0:$((maxlen-1))}…"
+    label="$slug"
+  fi
 
   local delay="${START_TICKET_CLAUDE_DELAY:-3}"
 
@@ -90,6 +106,9 @@ on run argv
         tell topPane
           set name to tabName
           write text "cd " & quoted form of wt & " && claude"
+          -- Re-assert the name after launching: shells/Claude may set their own
+          -- title, which would bury the ticket number.
+          set name to tabName
           set botPane to (split horizontally with default profile)
         end tell
         tell botPane
@@ -103,6 +122,10 @@ on run argv
         tell topPane
           write text (ESC & "[200~" & promptText & ESC & "[201~") newline false
           select
+          -- Final re-assert after the kickoff is typed: Claude's session-start
+          -- title update lands around here.
+          set name to tabName
+        end tell
         end tell
       end tell
     end tell
