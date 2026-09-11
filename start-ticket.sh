@@ -126,7 +126,6 @@ on run argv
           -- title update lands around here.
           set name to tabName
         end tell
-        end tell
       end tell
     end tell
   end tell
