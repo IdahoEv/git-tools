@@ -40,6 +40,10 @@ case "$review" in
   *) die "--review must be none, copilot, or copilot+claude (got '$review')" ;;
 esac
 
+if [ -n "$issue" ]; then
+  [[ "$issue" =~ ^[0-9]+$ ]] || die "--issue must be a positive integer (got '$issue')"
+fi
+
 git rev-parse --is-inside-work-tree >/dev/null 2>&1 || die "not inside a git repo"
 command -v gh >/dev/null || die "gh CLI not found"
 
@@ -52,7 +56,10 @@ esac
 # ---- PR: reuse if one already exists for this branch, else create ---------
 # Decide (and validate inputs) before pushing, so a usage error can't leave
 # a published branch behind as a side effect.
-existing_pr="$(gh pr view --json number --jq '.number' 2>/dev/null || true)"
+# gh pr list returns an empty result successfully when no PR exists for the
+# branch, so auth/network/repository failures still abort here (pre-push
+# validation) via set -e instead of being swallowed like the old || true.
+existing_pr="$(gh pr list --head "$branch" --json number --jq '.[0].number // empty')"
 create_pr=""
 if [ -n "$existing_pr" ]; then
   pr_number="$existing_pr"
@@ -63,19 +70,24 @@ else
   if [ -n "$body_file" ] && [ ! -f "$body_file" ]; then
     die "--body-file not found: $body_file"
   fi
-  # The default PR body ("Closes #N") needs an issue number; infer it from
-  # the branch name (worktree-manager formats: "<issue>-slug", "sc-<ticket-id>").
+  # The default PR body ("Closes #N") needs a GitHub issue number; infer it
+  # from the worktree-manager "<issue>-slug" branch format only. "sc-<ticket>"
+  # branches carry a Shortcut story id — a different namespace — so guessing
+  # it into "Closes #N" could close an unrelated GitHub issue; require
+  # --issue or --body-file there.
   if [ -z "$body_file" ] && [ -z "$issue" ]; then
-    if [[ "$branch" =~ ^([0-9]+)-.+$ || "$branch" =~ ^sc-([0-9]+) ]]; then
+    if [[ "$branch" =~ ^([0-9]+)-.+$ ]]; then
       issue="${BASH_REMATCH[1]}"
     else
-      die "can't infer issue number from branch '$branch' — pass --issue or --body-file"
+      die "can't infer GitHub issue number from branch '$branch' — pass --issue or --body-file"
     fi
   fi
 fi
 
 # ---- push --------------------------------------------------------------------
-git push -u origin "$branch"
+# stdout (the ref-update summary) is suppressed to keep this script's stdout
+# limited to the documented key=value fields; progress/errors go to stderr.
+git push -u origin "$branch" >/dev/null
 
 if [ -n "$create_pr" ]; then
   create_args=(--title "$title" --head "$branch")
@@ -118,7 +130,7 @@ if [ "$review" != "none" ]; then
   fi
 
   if [ "$review" = "copilot+claude" ]; then
-    gh workflow run claude.yml -f "pr_number=$pr_number" \
+    gh workflow run claude.yml -f "pr_number=$pr_number" >/dev/null \
       && echo "ship: dispatched claude.yml review for #$pr_number" >&2 \
       || echo "ship: WARN claude.yml dispatch failed" >&2
   fi
