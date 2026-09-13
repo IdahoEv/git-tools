@@ -16,7 +16,8 @@
 #   pr_url=<url>
 #   pr_action=created|reused
 #
-# Exit codes: 0 success; 1 usage/precondition error; 2 gh/API failure.
+# Exit codes: 0 success; 1 usage/precondition error (die); otherwise the
+# underlying git/gh command's exit status propagates via set -e.
 
 set -euo pipefail
 
@@ -45,34 +46,47 @@ command -v gh >/dev/null || die "gh CLI not found"
 branch="$(git branch --show-current)"
 [ -n "$branch" ] || die "not on a branch (detached HEAD)"
 case "$branch" in
-  main|master) die "refusing to ship from $branch" ;;
+  main|master|development) die "refusing to ship from $branch" ;;
 esac
 
-if [ -z "$issue" ]; then
-  if [[ "$branch" =~ ^([0-9]+)-.+$ ]]; then
-    issue="${BASH_REMATCH[1]}"
-  else
-    die "can't infer issue number from branch '$branch' — pass --issue"
-  fi
-fi
-
-# ---- push ------------------------------------------------------------------
-git push -u origin "$branch"
-
 # ---- PR: reuse if one already exists for this branch, else create ---------
+# Decide (and validate inputs) before pushing, so a usage error can't leave
+# a published branch behind as a side effect.
 existing_pr="$(gh pr view --json number --jq '.number' 2>/dev/null || true)"
+create_pr=""
 if [ -n "$existing_pr" ]; then
   pr_number="$existing_pr"
   pr_action="reused"
 else
+  create_pr=1
   [ -n "$title" ] || die "no existing PR for '$branch' and no --title given"
+  if [ -n "$body_file" ] && [ ! -f "$body_file" ]; then
+    die "--body-file not found: $body_file"
+  fi
+  # The default PR body ("Closes #N") needs an issue number; infer it from
+  # the branch name (worktree-manager formats: "<issue>-slug", "sc-<ticket-id>").
+  if [ -z "$body_file" ] && [ -z "$issue" ]; then
+    if [[ "$branch" =~ ^([0-9]+)-.+$ || "$branch" =~ ^sc-([0-9]+) ]]; then
+      issue="${BASH_REMATCH[1]}"
+    else
+      die "can't infer issue number from branch '$branch' — pass --issue or --body-file"
+    fi
+  fi
+fi
+
+# ---- push --------------------------------------------------------------------
+git push -u origin "$branch"
+
+if [ -n "$create_pr" ]; then
   create_args=(--title "$title" --head "$branch")
   if [ -n "$body_file" ]; then
     create_args+=(--body-file "$body_file")
   else
     create_args+=(--body "Closes #$issue")
   fi
-  gh pr create "${create_args[@]}"
+  # gh pr create prints the new PR URL to stdout; suppress it to keep this
+  # script's stdout limited to the documented key=value fields (pr_url below).
+  gh pr create "${create_args[@]}" >/dev/null
   pr_number="$(gh pr view --json number --jq '.number')"
   pr_action="created"
 fi
@@ -81,8 +95,6 @@ pr_url="$(gh pr view "$pr_number" --json url --jq '.url')"
 
 # ---- reviews ----------------------------------------------------------------
 if [ "$review" != "none" ]; then
-  owner="$(gh repo view --json owner --jq '.owner.login')"
-  repo="$(gh repo view --json name --jq '.name')"
   pr_node_id="$(gh pr view "$pr_number" --json id --jq '.id')"
 
   # Copilot's reviewer bot is a fixed bot account; resolve its node id live
