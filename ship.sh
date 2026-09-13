@@ -41,7 +41,7 @@ case "$review" in
 esac
 
 if [ -n "$issue" ]; then
-  [[ "$issue" =~ ^[0-9]+$ ]] || die "--issue must be a positive integer (got '$issue')"
+  [[ "$issue" =~ ^[1-9][0-9]*$ ]] || die "--issue must be a positive integer (got '$issue')"
 fi
 
 git rev-parse --is-inside-work-tree >/dev/null 2>&1 || die "not inside a git repo"
@@ -67,8 +67,8 @@ if [ -n "$existing_pr" ]; then
 else
   create_pr=1
   [ -n "$title" ] || die "no existing PR for '$branch' and no --title given"
-  if [ -n "$body_file" ] && [ ! -f "$body_file" ]; then
-    die "--body-file not found: $body_file"
+  if [ -n "$body_file" ] && { [ ! -f "$body_file" ] || [ ! -r "$body_file" ]; }; then
+    die "--body-file is not a readable file: $body_file"
   fi
   # The default PR body ("Closes #N") needs a GitHub issue number; infer it
   # from the worktree-manager "<issue>-slug" branch format only. "sc-<ticket>"
@@ -76,7 +76,7 @@ else
   # it into "Closes #N" could close an unrelated GitHub issue; require
   # --issue or --body-file there.
   if [ -z "$body_file" ] && [ -z "$issue" ]; then
-    if [[ "$branch" =~ ^([0-9]+)-.+$ ]]; then
+    if [[ "$branch" =~ ^([1-9][0-9]*)-.+$ ]]; then
       issue="${BASH_REMATCH[1]}"
     else
       die "can't infer GitHub issue number from branch '$branch' — pass --issue or --body-file"
@@ -115,8 +115,8 @@ if [ "$review" != "none" ]; then
   if [ -n "$copilot_bot_id" ]; then
     # botIds must be inlined into the query body, not passed as a `-F`/`-f`
     # variable — gh api's field flags pass JSON-array-shaped strings through
-    # as literal strings rather than deserializing them into a GraphQL list
-    # (confirmed against this exact mutation; see docs/plans/ship-command.md).
+    # as literal strings rather than deserializing them into a GraphQL list.
+    # (Confirmed against this exact mutation.)
     gh api graphql -f query="
       mutation(\$pid: ID!) {
         requestReviews(input: { pullRequestId: \$pid, botIds: [\"$copilot_bot_id\"], union: true }) {
@@ -130,9 +130,13 @@ if [ "$review" != "none" ]; then
   fi
 
   if [ "$review" = "copilot+claude" ]; then
-    gh workflow run claude.yml -f "pr_number=$pr_number" >/dev/null \
-      && echo "ship: dispatched claude.yml review for #$pr_number" >&2 \
-      || echo "ship: WARN claude.yml dispatch failed" >&2
+    if gh workflow view claude.yml >/dev/null 2>&1; then
+      gh workflow run claude.yml -f "pr_number=$pr_number" >/dev/null \
+        && echo "ship: dispatched claude.yml review for #$pr_number" >&2 \
+        || echo "ship: WARN claude.yml dispatch failed" >&2
+    else
+      echo "ship: WARN no claude.yml workflow in this repo — skipping Claude review dispatch" >&2
+    fi
   fi
 fi
 
