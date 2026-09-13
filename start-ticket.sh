@@ -13,7 +13,7 @@
 #   --provider flag → .start-ticket.conf (provider=…) → autodetect (gh vs short).
 #
 # Env knobs: START_TICKET_CLAUDE_DELAY (secs before typing the prompt, default 3),
-#   START_TICKET_TAB_MAXLEN (default 24), START_TICKET_PROVIDER_DIR.
+#   START_TICKET_TAB_MAXLEN (default 30), START_TICKET_PROVIDER_DIR.
 #
 # Providers: <script-dir>/start-ticket-providers/<name>.sh (override with
 # $START_TICKET_PROVIDER_DIR), each defining:
@@ -56,23 +56,25 @@ PROVIDER_DIR="${START_TICKET_PROVIDER_DIR:-$SCRIPT_DIR/start-ticket-providers}"
 #            UNSUBMITTED for review.
 #   bottom — a plain shell in the worktree.
 # The kickoff is also put on the clipboard as a fallback (paste with ⌘V).
-# Tab name = "#<n> <slug>" where the ticket number is ALWAYS kept and the slug is
+# Tab name = "Is<n> <slug>" where the ticket number is ALWAYS kept and the slug is
 # truncated instead (to START_TICKET_TAB_MAXLEN). The name is re-asserted after
 # commands are written so iTerm's automatic title updates don't clobber it.
 open_tab() {  # <worktree> <kickoff>
   local wt="$1" kf="$2"
   local branch; branch="$(git -C "$wt" branch --show-current 2>/dev/null || basename "$wt")"
 
-  # Branch "<n>-<slug>" -> "#<n> <slug>"; keep the number, truncate the slug.
+  # Branch "<n>-<slug>" -> "Is<n> <slug>"; keep the number, truncate the slug.
+  # "Is" (not "#") disambiguates issue numbers from PR numbers at a glance,
+  # since GitHub shares one number sequence between the two.
   local num="" slug="$branch"
   if [[ "$branch" =~ ^([0-9]+)-(.+)$ ]]; then
-    num="#${BASH_REMATCH[1]}"
+    num="Is${BASH_REMATCH[1]}"
     slug="${BASH_REMATCH[2]}"
   fi
-  local maxlen="${START_TICKET_TAB_MAXLEN:-24}"
+  local maxlen="${START_TICKET_TAB_MAXLEN:-30}"
   local label
   if [ -n "$num" ]; then
-    # Reserve room for "#N " and the ellipsis when truncating the slug.
+    # Reserve room for "IsN " and the ellipsis when truncating the slug.
     local budget=$((maxlen - ${#num} - 2))
     [ "${#slug}" -gt "$budget" ] && slug="${slug:0:$((budget-1))}…"
     label="$num $slug"
@@ -100,7 +102,14 @@ on run argv
   set ESC to (ASCII character 27)
   tell application "iTerm2"
     tell current window
-      set newTab to (create tab with default profile)
+      try
+        set newTab to (create tab with profile "Ticket")
+      on error
+        -- "Ticket" dynamic profile not loaded yet. Install it via
+        -- setup-ticket-profile.sh (writes the DynamicProfiles JSON; iTerm
+        -- picks it up live), but fall back rather than fail outright.
+        set newTab to (create tab with default profile)
+      end try
       tell newTab
         set topPane to current session
         tell topPane
@@ -109,7 +118,11 @@ on run argv
           -- Re-assert the name after launching: shells/Claude may set their own
           -- title, which would bury the ticket number.
           set name to tabName
-          set botPane to (split horizontally with default profile)
+          try
+            set botPane to (split horizontally with profile "Ticket")
+          on error
+            set botPane to (split horizontally with default profile)
+          end try
         end tell
         tell botPane
           set name to tabName
