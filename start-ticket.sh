@@ -47,7 +47,28 @@ while [ -h "$_src" ]; do
   [ "${_src#/}" = "$_src" ] && _src="$_dir/$_src"
 done
 SCRIPT_DIR="$(cd -P "$(dirname "$_src")" && pwd)"
-PROVIDER_DIR="${START_TICKET_PROVIDER_DIR:-$SCRIPT_DIR/start-ticket-providers}"
+# Provider lookup (first dir containing <name>.sh wins):
+#   1. $START_TICKET_PROVIDER_DIR (explicit override)
+#   2. <main-repo-root>/.git-tools/start-ticket-providers  (per-repo)
+#   3. ~/.config/git-tools/start-ticket-providers          (per-machine)
+#   4. this repo's start-ticket-providers/                 (shipped defaults)
+# Same layering as open-pr.sh's find_provider_file.
+find_provider_file() {  # <name> → path, or empty
+  local name="$1" main_root common pd f
+  common="$(git rev-parse --git-common-dir 2>/dev/null || true)"
+  if [ -n "$common" ]; then
+    common="$(cd -P "$common" 2>/dev/null && pwd)" && main_root="$(dirname "$common")" || main_root=""
+  fi
+  for pd in "${START_TICKET_PROVIDER_DIR:-}" \
+            "${main_root:-}/.git-tools/start-ticket-providers" \
+            "$HOME/.config/git-tools/start-ticket-providers" \
+            "$SCRIPT_DIR/start-ticket-providers"; do
+    [ -n "$pd" ] || continue
+    f="$pd/$name.sh"
+    [ -f "$f" ] && { printf '%s' "$f"; return 0; }
+  done
+  return 0
+}
 
 # ---- iTerm tab ---------------------------------------------------------------
 # Opens a new iTerm tab, split into two horizontal panes:
@@ -167,8 +188,15 @@ _url="$(git remote get-url origin 2>/dev/null || true)"
 if [ -n "$_url" ]; then repo_name="$(basename "${_url%.git}")"; else repo_name="$(basename "$repo_root")"; fi
 
 conf_get() {  # <key> → value from repo .start-ticket.conf, then ~/.config
-  local key="$1" f v
-  for f in "$repo_root/.start-ticket.conf" "$HOME/.config/start-ticket/config"; do
+  # `repo_root` is the cwd's toplevel; in a worktree the .start-ticket.conf
+  # lives in the MAIN repo root (--git-common-dir's parent), so check both.
+  local key="$1" f v main_root common
+  common="$(git rev-parse --git-common-dir 2>/dev/null || true)"
+  if [ -n "$common" ]; then
+    common="$(cd -P "$common" && pwd)"
+    main_root="$(dirname "$common")"
+  fi
+  for f in "$repo_root/.start-ticket.conf" "${main_root:-/nonexistent}/.start-ticket.conf" "$HOME/.config/start-ticket/config"; do
     [ -f "$f" ] || continue
     v="$(sed -n "s/^${key}=//p" "$f" | head -1)"
     [ -n "$v" ] && { printf '%s' "$v"; return 0; }
@@ -184,8 +212,8 @@ if [ -z "$provider" ]; then
   fi
 fi
 
-pf="$PROVIDER_DIR/$provider.sh"
-[ -f "$pf" ] || die "no provider script: $pf"
+pf="$(find_provider_file "$provider")"
+[ -n "$pf" ] || die "no provider script for '$provider' (searched: START_TICKET_PROVIDER_DIR, <repo>/.git-tools/start-ticket-providers, ~/.config/git-tools/start-ticket-providers, git-tools/start-ticket-providers)"
 # shellcheck source=/dev/null
 source "$pf"
 

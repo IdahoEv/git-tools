@@ -31,7 +31,29 @@ while [ -h "$_src" ]; do
   [ "${_src#/}" = "$_src" ] && _src="$_dir/$_src"
 done
 SCRIPT_DIR="$(cd -P "$(dirname "$_src")" && pwd)"
-PROVIDER_DIR="${OPEN_PR_PROVIDER_DIR:-$SCRIPT_DIR/open-pr-providers}"
+# Provider lookup (first dir containing <name>.sh wins):
+#   1. $OPEN_PR_PROVIDER_DIR (explicit override)
+#   2. <main-repo-root>/.git-tools/open-pr-providers  (per-repo)
+#   3. ~/.config/git-tools/open-pr-providers          (per-machine, environment-wide)
+#   4. this repo's open-pr-providers/                 (shipped defaults)
+# This keeps environment-specific providers (e.g. a work environment) out of
+# the personal git-tools repo while letting any layer ship one.
+find_provider_file() {  # <name> → path, or empty
+  local name="$1" main_root common pd f
+  common="$(git rev-parse --git-common-dir 2>/dev/null || true)"
+  if [ -n "$common" ]; then
+    common="$(cd -P "$common" 2>/dev/null && pwd)" && main_root="$(dirname "$common")" || main_root=""
+  fi
+  for pd in "${OPEN_PR_PROVIDER_DIR:-}" \
+            "${main_root:-}/.git-tools/open-pr-providers" \
+            "$HOME/.config/git-tools/open-pr-providers" \
+            "$SCRIPT_DIR/open-pr-providers"; do
+    [ -n "$pd" ] || continue
+    f="$pd/$name.sh"
+    [ -f "$f" ] && { printf '%s' "$f"; return 0; }
+  done
+  return 0
+}
 
 # ---- args -------------------------------------------------------------------
 title="" body_file="" issue="" review="copilot" provider=""
@@ -67,12 +89,29 @@ esac
 
 # ---- provider ---------------------------------------------------------------
 # Reviewer/bot wiring and this environment's PR title/body/branch conventions
-# are per-repo-family, not per-script — a provider encapsulates them. `kardashev`
-# is today's only provider (and the default); a work-environment provider lands
-# later. Providers mirror start-ticket-providers/.
+# are per-repo-family, not per-script — a provider encapsulates them. Providers
+# mirror start-ticket-providers/. Resolution mirrors start-ticket.sh: --provider
+# flag → openpr_provider= in the repo's .start-ticket.conf → kardashev default.
+if [ -z "$provider" ]; then
+  # In a worktree, --show-toplevel is the worktree path, but .start-ticket.conf
+  # lives in the main repo root — resolve both (--git-common-dir's parent is
+  # the main worktree even from a linked worktree).
+  _repo_root="$(git rev-parse --show-toplevel 2>/dev/null || true)"
+  _main_root=""
+  _common="$(git rev-parse --git-common-dir 2>/dev/null || true)"
+  if [ -n "$_common" ]; then
+    _common="$(cd -P "$_common" && pwd)"
+    _main_root="$(dirname "$_common")"
+  fi
+  for _f in "${_repo_root:-/nonexistent}/.start-ticket.conf" "${_main_root:-/nonexistent}/.start-ticket.conf" "$HOME/.config/start-ticket/config"; do
+    [ -f "$_f" ] || continue
+    _v="$(sed -n 's/^openpr_provider=//p' "$_f" | head -1)"
+    [ -n "$_v" ] && { provider="$_v"; break; }
+  done
+fi
 provider="${provider:-kardashev}"
-pf="$PROVIDER_DIR/$provider.sh"
-[ -f "$pf" ] || die "no provider script: $pf"
+pf="$(find_provider_file "$provider")"
+[ -n "$pf" ] || die "no provider script for '$provider' (searched: OPEN_PR_PROVIDER_DIR, <repo>/.git-tools/open-pr-providers, ~/.config/git-tools/open-pr-providers, git-tools/open-pr-providers)"
 # shellcheck source=/dev/null
 PROVIDER_TRIGGER_MODE=""   # providers may declare their own; default manual below
 source "$pf"

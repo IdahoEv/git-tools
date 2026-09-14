@@ -340,9 +340,25 @@ fetch_shortcut_ticket() {
 
     info "Fetching Shortcut ticket #${ticket_id}..."
 
-    # Get the git branch name format from Shortcut
+    # Get the git branch name format from Shortcut. `--git-branch-short` works by
+    # literally checking the branch out in the current git repo — so run it inside
+    # a throwaway repo, not the user's. Otherwise it hijacks whatever branch the
+    # invoking worktree has checked out. The throwaway repo needs an `origin`
+    # remote pointing at the real repo and at least one commit, or `short`
+    # silently skips the checkout and never prints the branch name.
     local branch_name
-    branch_name=$(short story "$ticket_id" --git-branch-short --quiet 2>/dev/null | grep "^Switched to" | sed 's/Switched to a new branch //' | tr -d "'\"" || true)
+    local scratch
+    scratch=$(mktemp -d)
+    git -C "$scratch" init -q -b main
+    git -C "$scratch" remote add origin "$(git remote get-url origin 2>/dev/null || echo https://example.invalid/x.git)"
+    git -C "$scratch" commit -q --allow-empty -m scratch
+    # The checkout result line goes to stderr (and is CLI-version-fragile), so
+    # don't parse CLI text at all — read the checked-out branch from the scratch
+    # repo's git state.
+    (cd "$scratch" && short story "$ticket_id" --git-branch-short --quiet >/dev/null 2>&1 || true)
+    branch_name=$(git -C "$scratch" branch --show-current 2>/dev/null || true)
+    [ "$branch_name" = "main" ] && branch_name=""    # checkout never happened
+    rm -rf "$scratch"
 
     if [ -z "$branch_name" ]; then
         # Fallback: try to construct it manually
