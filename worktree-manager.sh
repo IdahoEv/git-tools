@@ -366,6 +366,24 @@ fetch_shortcut_ticket() {
         warning "Could not auto-generate branch name, using: $branch_name"
     fi
 
+    # Shortcut generates branch names as {username}/{ticket}/{slug} (e.g.
+    # evandorn4181/sc-74085/fix-thing). Strip the username segment so branch
+    # and worktree dir names start at the ticket id. Only strip when the
+    # middle segment is exactly a numeric ticket id (sc-<digits>) AND the
+    # first segment isn't a conventional prefix, so feature/sc-...,
+    # fix/sc-..., and non-ticket slugs like sc-foo1 survive.
+    case "$branch_name" in
+        feature/*|fix/*|chore/*|bug/*|hotfix/*|refactor/*|docs/*|test/*|release/*)
+            ;;
+        *)
+            if [[ "$branch_name" =~ ^[^/]+/sc-[0-9]+/[^/]+$ ]]; then
+                local stripped="${branch_name#*/}"
+                info "Stripping username prefix from branch name: $branch_name -> $stripped"
+                branch_name="$stripped"
+            fi
+            ;;
+    esac
+
     echo "$branch_name"
 }
 
