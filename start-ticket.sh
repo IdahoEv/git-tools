@@ -1,19 +1,32 @@
 #!/usr/bin/env bash
 # start-ticket.sh — spin up a worktree + Claude session for a tracker ticket.
 #
-#   start-ticket.sh <id> [--provider github|shortcut] [--no-tab]
-#   start-ticket.sh --tab-only <worktree> <kickoff>
+#   start-ticket.sh <id> [--provider github|shortcut] [--no-tab] [--launcher iterm|bg|none]
+#   start-ticket.sh --tab-only <worktree> <kickoff> [--launcher iterm|bg|none]
 #
 # Resolves a ticket (GitHub issue or Shortcut story) to a branch, creates a
 # worktree via worktree-manager.sh, marks the ticket in progress, writes a
-# kickoff prompt, and opens a 2-pane iTerm tab (claude on top with the prompt
-# typed in but unsubmitted; a shell on the bottom).
+# kickoff prompt, and starts a Claude session for it with a "launcher":
+#   iterm (default)  a 2-pane iTerm tab: claude on top with the prompt typed in
+#                    but unsubmitted; a shell on the bottom.
+#   bg               a background session for Claude Code's agent view
+#                    (`claude agents`): claude --bg --name "<label>" "<kickoff>".
+#                    The kickoff is SUBMITTED immediately, so it starts in plan
+#                    mode by default to keep a review gate (see bg_permission_mode).
+#   none             worktree + kickoff only (same as --no-tab).
+#
+# Launcher is chosen by, in order: --launcher flag → $START_TICKET_LAUNCHER →
+# `launcher=` in .start-ticket.conf / ~/.config/start-ticket/config → iterm.
+# Put `launcher=bg` in the per-machine ~/.config/start-ticket/config to opt in.
 #
 # Run from anywhere inside the target repo. Provider is chosen by, in order:
 #   --provider flag → .start-ticket.conf (provider=…) → autodetect (gh vs short).
 #
 # Env knobs: START_TICKET_CLAUDE_DELAY (secs before typing the prompt, default 3),
-#   START_TICKET_TAB_MAXLEN (default 30), START_TICKET_PROVIDER_DIR.
+#   START_TICKET_TAB_MAXLEN (default 30), START_TICKET_PROVIDER_DIR,
+#   START_TICKET_BG_MAXLEN (agent-view row name length, default 70),
+#   START_TICKET_BG_PERMISSION_MODE or `bg_permission_mode=` in the conf files
+#   (bg launcher only; default "plan"; "default" passes no --permission-mode).
 #
 # Providers: <script-dir>/start-ticket-providers/<name>.sh (override with
 # $START_TICKET_PROVIDER_DIR), each defining:
@@ -70,6 +83,57 @@ find_provider_file() {  # <name> → path, or empty
   return 0
 }
 
+conf_get() {  # <key> → value from repo .start-ticket.conf, then ~/.config
+  # In a worktree the .start-ticket.conf lives in the MAIN repo root
+  # (--git-common-dir's parent), so check the cwd's toplevel and that.
+  local key="$1" f v main_root="" common top
+  top="$(git rev-parse --show-toplevel 2>/dev/null || true)"
+  common="$(git rev-parse --git-common-dir 2>/dev/null || true)"
+  if [ -n "$common" ]; then
+    common="$(cd -P "$common" 2>/dev/null && pwd)" && main_root="$(dirname "$common")" || main_root=""
+  fi
+  for f in "${top:-/nonexistent}/.start-ticket.conf" "${main_root:-/nonexistent}/.start-ticket.conf" "$HOME/.config/start-ticket/config"; do
+    [ -f "$f" ] || continue
+    v="$(sed -n "s/^${key}=//p" "$f" | head -1)"
+    [ -n "$v" ] && { printf '%s' "$v"; return 0; }
+  done
+  return 1
+}
+
+# setting <conf-key> <ENV_VAR> <default>: env var → conf file → default.
+setting() {
+  local v="${!2:-}"
+  [ -n "$v" ] || v="$(conf_get "$1" || true)"
+  printf '%s' "${v:-$3}"
+}
+
+# make_label <branch> <maxlen> [pretty] → short tab / agent-view row label.
+# Branch "<n>-<slug>" -> "Is<n> <slug>"; Shortcut "<user>/sc-<id>/<slug>" ->
+# "Sc<id> <slug>". The ticket number is ALWAYS kept; the slug is truncated.
+# "Is" (not "#") disambiguates issue numbers from PR numbers at a glance,
+# since GitHub shares one number sequence between the two. With "pretty",
+# hyphens in the slug become spaces (more readable in agent-view rows).
+make_label() {
+  local branch="$1" maxlen="$2" pretty="${3:-}" num="" slug="$1"
+  if [[ "$branch" =~ ^([0-9]+)-(.+)$ ]]; then
+    num="Is${BASH_REMATCH[1]}"
+    slug="${BASH_REMATCH[2]}"
+  elif [[ "$branch" =~ (^|/)sc-([0-9]+)/(.+)$ ]]; then
+    num="Sc${BASH_REMATCH[2]}"
+    slug="${BASH_REMATCH[3]}"
+  fi
+  [ -n "$pretty" ] && slug="${slug//-/ }"
+  if [ -n "$num" ]; then
+    # Reserve room for "IsN " and the ellipsis when truncating the slug.
+    local budget=$((maxlen - ${#num} - 2))
+    [ "${#slug}" -gt "$budget" ] && slug="${slug:0:$((budget-1))}…"
+    printf '%s %s' "$num" "$slug"
+  else
+    [ "${#slug}" -gt "$maxlen" ] && slug="${slug:0:$((maxlen-1))}…"
+    printf '%s' "$slug"
+  fi
+}
+
 # ---- iTerm tab ---------------------------------------------------------------
 # Opens a new iTerm tab, split into two horizontal panes:
 #   top    — `claude` (bare); the kickoff prompt is typed into its input via a
@@ -84,25 +148,7 @@ open_tab() {  # <worktree> <kickoff>
   local wt="$1" kf="$2"
   local branch; branch="$(git -C "$wt" branch --show-current 2>/dev/null || basename "$wt")"
 
-  # Branch "<n>-<slug>" -> "Is<n> <slug>"; keep the number, truncate the slug.
-  # "Is" (not "#") disambiguates issue numbers from PR numbers at a glance,
-  # since GitHub shares one number sequence between the two.
-  local num="" slug="$branch"
-  if [[ "$branch" =~ ^([0-9]+)-(.+)$ ]]; then
-    num="Is${BASH_REMATCH[1]}"
-    slug="${BASH_REMATCH[2]}"
-  fi
-  local maxlen="${START_TICKET_TAB_MAXLEN:-30}"
-  local label
-  if [ -n "$num" ]; then
-    # Reserve room for "IsN " and the ellipsis when truncating the slug.
-    local budget=$((maxlen - ${#num} - 2))
-    [ "${#slug}" -gt "$budget" ] && slug="${slug:0:$((budget-1))}…"
-    label="$num $slug"
-  else
-    [ "${#slug}" -gt "$maxlen" ] && slug="${slug:0:$((maxlen-1))}…"
-    label="$slug"
-  fi
+  local label; label="$(make_label "$branch" "${START_TICKET_TAB_MAXLEN:-30}")"
 
   local delay="${START_TICKET_CLAUDE_DELAY:-3}"
 
@@ -167,42 +213,83 @@ end run
 OSA
 }
 
+# ---- background session (Claude Code agent view) -----------------------------
+# Starts `claude --bg` in the worktree so the session shows up as a row in
+# `claude agents`, named "Is<n> <slug>" (hyphens → spaces, START_TICKET_BG_MAXLEN
+# long). Because the worktree already exists (worktree-manager.sh made it),
+# Claude Code uses it as-is rather than creating its own under .claude/worktrees/,
+# so .worktree-sync seeding is preserved and /finalize's cleanup still applies.
+# Unlike the iTerm launcher, the kickoff is submitted immediately; the default
+# permission mode is therefore "plan" (Claude proposes before editing).
+# claude's own output goes to stderr to keep this script's stdout parseable.
+open_bg() {  # <worktree> <kickoff>
+  local wt="$1" kf="$2"
+  command -v claude >/dev/null || die "claude CLI not found (needed by the bg launcher)"
+  local branch; branch="$(git -C "$wt" branch --show-current 2>/dev/null || basename "$wt")"
+  local label; label="$(make_label "$branch" "${START_TICKET_BG_MAXLEN:-70}" pretty)"
+  local perm; perm="$(setting bg_permission_mode START_TICKET_BG_PERMISSION_MODE plan)"
+  local args=(--bg --name "$label")
+  [ "$perm" = "default" ] || args+=(--permission-mode "$perm")
+
+  printf 'start-ticket: dispatching background session "%s" (permission mode: %s)\n' "$label" "$perm" >&2
+  if ! ( cd "$wt" && claude "${args[@]}" "$(cat "$kf")" ) >&2; then
+    printf 'start-ticket: `claude --bg` failed. If it mentioned workspace trust, run `cd %q && claude` once to accept the trust dialog, then retry:\n  cd %q && claude --bg --name %q "$(cat %q)"\n' \
+      "$wt" "$wt" "$label" "$kf" >&2
+    return 1
+  fi
+}
+
+launch_session() {  # <worktree> <kickoff> — uses the resolved $launcher
+  case "$launcher" in
+    iterm) open_tab "$1" "$2" ;;
+    bg)    open_bg  "$1" "$2" ;;
+    none)  : ;;
+  esac
+}
+
 # ---- args ------------------------------------------------------------------
-id="" provider="" mode="full"
+id="" provider="" mode="full" launcher_flag="" tab_wt="" tab_kf=""
 while [ $# -gt 0 ]; do
   case "$1" in
     --provider) provider="${2:?--provider needs a value}"; shift 2 ;;
     --no-tab)   mode="no-tab"; shift ;;
-    --tab-only) open_tab "${2:?}" "${3:?}"; exit 0 ;;
-    -h|--help)  sed -n '2,25p' "$0"; exit 0 ;;
+    --tab-only) mode="tab-only"
+                tab_wt="${2:?--tab-only needs <worktree> <kickoff>}"
+                tab_kf="${3:?--tab-only needs <worktree> <kickoff>}"
+                shift 3 ;;
+    --launcher) launcher_flag="${2:?--launcher needs a value}"; shift 2 ;;
+    -h|--help)  sed -n '2,/^$/p' "$0"; exit 0 ;;
     -*)         die "unknown flag: $1" ;;
     *)          id="$1"; shift ;;
   esac
 done
-[ -n "$id" ] || die "usage: start-ticket.sh <id> [--provider github|shortcut] [--no-tab]"
+
+# --tab-only runs from wherever the caller is: move into the worktree so the
+# per-repo .start-ticket.conf resolves, after making the kickoff path absolute.
+if [ "$mode" = "tab-only" ]; then
+  tab_kf="$(cd "$(dirname "$tab_kf")" && pwd)/$(basename "$tab_kf")"
+  cd "$tab_wt" || die "worktree not found: $tab_wt"
+fi
+
+launcher="$launcher_flag"
+[ -n "$launcher" ] || launcher="$(setting launcher START_TICKET_LAUNCHER iterm)"
+case "$launcher" in
+  iterm|bg|none) ;;
+  *) die "unknown launcher '$launcher' (expected iterm, bg, or none)" ;;
+esac
+
+if [ "$mode" = "tab-only" ]; then
+  launch_session "$tab_wt" "$tab_kf"
+  exit 0
+fi
+
+[ -n "$id" ] || die "usage: start-ticket.sh <id> [--provider github|shortcut] [--no-tab] [--launcher iterm|bg|none]"
 
 # ---- repo + provider -----------------------------------------------------
 git rev-parse --is-inside-work-tree >/dev/null 2>&1 || die "not inside a git repo"
 repo_root="$(git rev-parse --show-toplevel)"
 _url="$(git remote get-url origin 2>/dev/null || true)"
 if [ -n "$_url" ]; then repo_name="$(basename "${_url%.git}")"; else repo_name="$(basename "$repo_root")"; fi
-
-conf_get() {  # <key> → value from repo .start-ticket.conf, then ~/.config
-  # `repo_root` is the cwd's toplevel; in a worktree the .start-ticket.conf
-  # lives in the MAIN repo root (--git-common-dir's parent), so check both.
-  local key="$1" f v main_root common
-  common="$(git rev-parse --git-common-dir 2>/dev/null || true)"
-  if [ -n "$common" ]; then
-    common="$(cd -P "$common" && pwd)"
-    main_root="$(dirname "$common")"
-  fi
-  for f in "$repo_root/.start-ticket.conf" "${main_root:-/nonexistent}/.start-ticket.conf" "$HOME/.config/start-ticket/config"; do
-    [ -f "$f" ] || continue
-    v="$(sed -n "s/^${key}=//p" "$f" | head -1)"
-    [ -n "$v" ] && { printf '%s' "$v"; return 0; }
-  done
-  return 1
-}
 
 [ -n "$provider" ] || provider="$(conf_get provider || true)"
 if [ -z "$provider" ]; then
@@ -256,4 +343,4 @@ _tmp="${TMPDIR:-/tmp}"; kickoff="${_tmp%/}/${repo_name}-kickoff-${id}.md"
 
 printf 'worktree=%s\nkickoff=%s\n' "$wt" "$kickoff"   # stdout: parseable by callers
 [ "$mode" = "no-tab" ] && exit 0
-open_tab "$wt" "$kickoff"
+launch_session "$wt" "$kickoff"
