@@ -233,8 +233,9 @@ open_bg() {  # <worktree> <kickoff>
 
   printf 'start-ticket: dispatching background session "%s" (permission mode: %s)\n' "$label" "$perm" >&2
   if ! ( cd "$wt" && claude "${args[@]}" "$(cat "$kf")" ) >&2; then
-    printf 'start-ticket: `claude --bg` failed. If it mentioned workspace trust, run `cd %q && claude` once to accept the trust dialog, then retry:\n  cd %q && claude --bg --name %q "$(cat %q)"\n' \
-      "$wt" "$wt" "$label" "$kf" >&2
+    local retry_args; retry_args="$(printf '%q ' "${args[@]}")"
+    printf 'start-ticket: `claude --bg` failed. If it mentioned workspace trust, run `cd %q && claude` once to accept the trust dialog, then retry:\n  cd %q && claude %s"$(cat %q)"\n' \
+      "$wt" "$wt" "$retry_args" "$kf" >&2
     return 1
   fi
 }
