@@ -47,37 +47,12 @@ provider::pr_body() {  # <issue> → "Closes #NNN"
 
 provider::trigger_reviews() {  # <pr_number> <level: copilot|copilot+claude>
   local pr_number="$1" level="$2"
-  local pr_node_id copilot_bot_id
 
-  pr_node_id="$(gh pr view "$pr_number" --json id --jq '.id')"
-
-  # Copilot's reviewer bot is a fixed bot account; resolve its node id live
-  # rather than hardcoding it, in case it ever differs per install.
-  copilot_bot_id="$(gh api "users/copilot-pull-request-reviewer%5Bbot%5D" --jq '.node_id' 2>/dev/null || true)"
-  if [ -n "$copilot_bot_id" ]; then
-    # botIds must be inlined into the query body, not passed as a `-F`/`-f`
-    # variable — gh api's field flags pass JSON-array-shaped strings through
-    # as literal strings rather than deserializing them into a GraphQL list.
-    # (Confirmed against this exact mutation.)
-    gh api graphql -f query="
-      mutation(\$pid: ID!) {
-        requestReviews(input: { pullRequestId: \$pid, botIds: [\"$copilot_bot_id\"], union: true }) {
-          clientMutationId
-        }
-      }" -f pid="$pr_node_id" >/dev/null \
-      && echo "open-pr: requested Copilot review on #$pr_number" >&2 \
-      || echo "open-pr: WARN Copilot review request failed" >&2
-  else
-    echo "open-pr: WARN couldn't resolve Copilot bot id, skipping Copilot review request" >&2
-  fi
-
-  if [ "$level" = "copilot+claude" ]; then
-    if gh workflow view claude.yml >/dev/null 2>&1; then
-      gh workflow run claude.yml -f "pr_number=$pr_number" >/dev/null \
-        && echo "open-pr: dispatched claude.yml review for #$pr_number" >&2 \
-        || echo "open-pr: WARN claude.yml dispatch failed" >&2
-    else
-      echo "open-pr: WARN no claude.yml workflow in this repo — skipping Claude review dispatch" >&2
-    fi
-  fi
+  # Delegates to request-review.sh (single source of truth for the Copilot
+  # requestReviews mutation + claude.yml dispatch) so the same logic is also
+  # reachable standalone — e.g. to re-request a Copilot review after a later
+  # push, which doesn't happen automatically. $SCRIPT_DIR is open-pr.sh's,
+  # inherited since this provider is sourced into its process.
+  "$SCRIPT_DIR/request-review.sh" --pr "$pr_number" --level "$level" \
+    || echo "open-pr: WARN review request failed (see request-review output above)" >&2
 }
