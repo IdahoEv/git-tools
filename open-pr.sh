@@ -160,7 +160,7 @@ else
     if [ -n "$issue" ] && declare -f provider::pr_body_footer >/dev/null; then
       footer="$(provider::pr_body_footer "$issue")"
     fi
-    if [ -n "$footer" ] && ! grep -qiF "$footer" "$body_file"; then
+    if [ -n "$footer" ] && ! grep -qixF "$footer" "$body_file"; then
       # Don't mutate the caller's file; gh reads the body from a copy.
       body_tmp="$(mktemp "${TMPDIR:-/tmp}/open-pr-body.XXXXXX")"
       trap 'rm -f "$body_tmp"' EXIT
