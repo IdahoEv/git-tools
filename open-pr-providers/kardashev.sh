@@ -41,7 +41,14 @@ provider::pr_title() {  # <issue> <title> → "Is<NNN>: <title>" (idempotent)
   fi
 }
 
-provider::pr_body() {  # <issue> → "Closes #NNN"
+provider::pr_body() {  # <issue> → "Closes #NNN" (default body, no --body-file)
+  printf 'Closes #%s\n' "$1"
+}
+
+provider::pr_body_footer() {  # <issue> → "Closes #NNN", appended to a drafted body
+  # GitHub issues share a namespace with PRs here, so the auto-close keyword is
+  # meaningful and belongs on every PR — including ones whose body /open-pr
+  # drafted. open-pr.sh skips this when the body already contains it.
   printf 'Closes #%s\n' "$1"
 }
 
