@@ -150,7 +150,25 @@ else
   title="$(provider::pr_title "$issue" "$title")"
 
   if [ -n "$body_file" ]; then
-    body_args=(--body-file "$body_file")
+    # The caller drafted a real summary. Any tracker-linking convention
+    # ("Closes #N" on providers whose PRs live in the same issue namespace) is
+    # the provider's business, not the caller's — appending it here keeps
+    # /open-pr's drafting step provider-agnostic and stops a hand-written
+    # footer from duplicating or contradicting the provider's.
+    # Providers that need no footer leave pr_body_footer undefined / empty.
+    footer=""
+    if [ -n "$issue" ] && declare -f provider::pr_body_footer >/dev/null; then
+      footer="$(provider::pr_body_footer "$issue")"
+    fi
+    if [ -n "$footer" ] && ! grep -qiF "$footer" "$body_file"; then
+      # Don't mutate the caller's file; gh reads the body from a copy.
+      body_tmp="$(mktemp "${TMPDIR:-/tmp}/open-pr-body.XXXXXX")"
+      trap 'rm -f "$body_tmp"' EXIT
+      { cat "$body_file"; printf '\n%s\n' "$footer"; } > "$body_tmp"
+      body_args=(--body-file "$body_tmp")
+    else
+      body_args=(--body-file "$body_file")
+    fi
   else
     [ -n "$issue" ] || die "can't infer issue number from branch '$branch' — pass --issue or --body-file"
     body_args=(--body "$(provider::pr_body "$issue")")
