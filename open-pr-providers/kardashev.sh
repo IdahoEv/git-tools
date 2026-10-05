@@ -53,6 +53,6 @@ provider::trigger_reviews() {  # <pr_number> <level: copilot|copilot+claude>
   # reachable standalone — e.g. to re-request a Copilot review after a later
   # push, which doesn't happen automatically. $SCRIPT_DIR is open-pr.sh's,
   # inherited since this provider is sourced into its process.
-  "$SCRIPT_DIR/request-review.sh" --pr "$pr_number" --level "$level" \
+  "$SCRIPT_DIR/request-review.sh" --pr "$pr_number" --level "$level" >/dev/null \
     || echo "open-pr: WARN review request failed (see request-review output above)" >&2
 }
