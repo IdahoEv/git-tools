@@ -40,3 +40,20 @@ provider::mark_in_progress() {
   gh issue edit    "$1" --add-assignee @me >/dev/null
   gh issue comment "$1" --body "🚧 In progress — branch \`${ST_BRANCH}\`." >/dev/null
 }
+
+# Read the tracker state back after the write, so start-ticket.sh can report
+# what actually landed instead of making the caller verify by hand.
+# "In progress" on GitHub means open AND assigned to us.
+provider::read_state() {  # <id> → "<state>" on stdout; rc 0 if genuinely in progress
+  local id="$1" me json state assigned
+  me="$(gh api user --jq .login 2>/dev/null || true)"
+  json="$(gh issue view "$id" --json state,assignees 2>/dev/null)" || { printf 'unknown'; return 1; }
+  state="$(jq -r '.state' <<<"$json")"
+  assigned=""
+  [ -n "$me" ] && jq -r '.assignees[].login' <<<"$json" | grep -qx "$me" && assigned=1
+  if [ "$state" = OPEN ] && [ -n "$assigned" ]; then
+    printf 'open, assigned to %s' "$me"; return 0
+  fi
+  printf '%s%s' "$state" "${assigned:+, assigned}"
+  return 1
+}

@@ -41,3 +41,18 @@ provider::mark_in_progress() {
   short story update "$1" --state "$state" >/dev/null 2>&1 \
     || echo "shortcut: couldn't set state '$state' on $1 (check 'short story update' syntax / state name)" >&2
 }
+
+# `short story update --state` is KNOWN BROKEN: it prints "Error fetching story
+# NaN" and still exits 0, so mark_in_progress above reports success having done
+# nothing. Reads are fine, so read the state back and let start-ticket.sh print
+# the truth; the repair itself needs the Shortcut MCP tools and stays in /start.
+provider::read_state() {  # <id> → "<state>" on stdout; rc 0 only if started
+  local id="$1" out state want
+  out="$(short story "$id" --quiet 2>/dev/null)" || { printf 'unknown'; return 1; }
+  state="$(awk 'match($0,/^[Ss]tate:[[:space:]]*/){print substr($0,RLENGTH+1);exit}' <<<"$out")"
+  [ -n "$state" ] || { printf 'unknown'; return 1; }
+  printf '%s' "$state"
+  want="$(conf_get shortcut_in_progress_state || true)"
+  want="${want:-${SHORTCUT_IN_PROGRESS_STATE:-In Development}}"
+  [ "$state" = "$want" ]
+}

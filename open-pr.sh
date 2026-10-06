@@ -192,6 +192,43 @@ fi
 
 pr_url="$(gh pr view "$pr_number" --json url --jq '.url')"
 
+# ---- title self-check -------------------------------------------------------
+# This script applied the prefix (provider::pr_title), so it is also the thing
+# that can tell whether the result is right — /open-pr used to read the title
+# back and reason about it by hand, one round-trip per ship. A doubled prefix
+# means the caller's draft already carried one; provider::pr_title is
+# idempotent for its OWN dialect but can't catch a foreign one (the
+# `sc-73237: Is73237: …` case). Repair it here and say so.
+pr_title_now="$(gh pr view "$pr_number" --json title --jq '.title')"
+pr_title_fixed=""
+if [ -n "$create_pr" ] && [ -n "${issue:-}" ]; then
+  expected="$(provider::pr_title "$issue" "")"
+  expected="${expected% }"                     # bare prefix, e.g. "Is42:" / "sc-42:"
+  if [ -n "$expected" ]; then
+    # Strip every leading ticket prefix — this provider's own (repeated) AND a
+    # foreign dialect's. Both dialects git-tools creates are matched, because
+    # the failure mode that reached production was a cross-dialect double
+    # (`sc-73237: Is73237: …`), which an idempotency check on one dialect alone
+    # cannot see. Then re-apply exactly one.
+    rest="$pr_title_now" n=0
+    while :; do
+      if [ "${rest#"$expected"}" != "$rest" ]; then
+        rest="${rest#"$expected"}"
+      elif [[ "$rest" =~ ^(Is[0-9]+|sc-[0-9]+):[[:space:]] ]]; then
+        rest="${rest#"${BASH_REMATCH[1]}":}"
+      else
+        break
+      fi
+      rest="${rest# }"; n=$((n + 1))
+    done
+    if [ "$n" -gt 1 ] || { [ "$n" -eq 1 ] && [ "${pr_title_now#"$expected"}" = "$pr_title_now" ]; }; then
+      gh pr edit "$pr_number" --title "$expected $rest" >/dev/null
+      pr_title_fixed="$pr_title_now"
+      pr_title_now="$expected $rest"
+    fi
+  fi
+fi
+
 # ---- reviews ----------------------------------------------------------------
 if [ "$review" != "none" ]; then
   # trigger_mode seam: "manual" providers dispatch their review triggers here
@@ -207,3 +244,9 @@ if [ "$review" != "none" ]; then
 fi
 
 printf 'pr_number=%s\npr_url=%s\npr_action=%s\n' "$pr_number" "$pr_url" "$pr_action"
+# Reported so /open-pr can describe reviews accurately without re-reading the
+# conf: under "auto" the bots fire on PR open and nothing was dispatched here.
+printf 'provider=%s\ntrigger_mode=%s\npr_title=%s\n' \
+  "$provider" "${PROVIDER_TRIGGER_MODE:-manual}" "$pr_title_now"
+[ -n "$pr_title_fixed" ] && printf 'pr_title_repaired_from=%s\n' "$pr_title_fixed"
+exit 0

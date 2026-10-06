@@ -324,6 +324,20 @@ branch="$(git -C "$wt" branch --show-current)"
 declare -f provider::post_worktree >/dev/null && provider::post_worktree "$id" "$wt"
 provider::mark_in_progress "$id" || echo "start-ticket: WARN mark_in_progress failed" >&2
 
+# mark_in_progress is best-effort and some tracker CLIs fail while exiting 0, so
+# read the state back here rather than making the caller verify. ticket_state is
+# what the tracker ACTUALLY reports; ticket_in_progress says whether that counts
+# as started. ticket_in_progress=no means /start must repair it (Shortcut: via
+# the MCP tools — its CLI's state-set is broken).
+ticket_state="" ticket_in_progress="unknown"
+if declare -f provider::read_state >/dev/null; then
+  if ticket_state="$(provider::read_state "$id")"; then
+    ticket_in_progress="yes"
+  else
+    ticket_in_progress="no"
+  fi
+fi
+
 # ---- kickoff ---------------------------------------------------------
 _tmp="${TMPDIR:-/tmp}"; kickoff="${_tmp%/}/${repo_name}-kickoff-${id}.md"
 {
@@ -342,6 +356,9 @@ _tmp="${TMPDIR:-/tmp}"; kickoff="${_tmp%/}/${repo_name}-kickoff-${id}.md"
   fi
 } > "$kickoff"
 
-printf 'worktree=%s\nkickoff=%s\n' "$wt" "$kickoff"   # stdout: parseable by callers
+# stdout: parseable by callers
+printf 'worktree=%s\nkickoff=%s\nbranch=%s\nprovider=%s\n' "$wt" "$kickoff" "$branch" "$provider"
+printf 'ticket_state=%s\nticket_in_progress=%s\nticket_parent=%s\n' \
+  "$ticket_state" "$ticket_in_progress" "$ST_PARENT"
 [ "$mode" = "no-tab" ] && exit 0
 launch_session "$wt" "$kickoff"
