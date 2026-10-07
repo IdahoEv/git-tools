@@ -148,7 +148,7 @@ for repo in "${candidates[@]}"; do
       "worktree "*) wt="${line#worktree }"; br="" ;;
       "branch "*)   br="${line#branch }"; br="${br#refs/heads/}" ;;
       "")
-        if [ -n "$wt" ] && [ -n "$br" ] && [ "$(ticket_from_branch "$br")" = "$ticket" ]; then
+        if [ -n "$wt" ] && [ -n "$br" ] && [ "$(gt::ticket_from_branch "$br")" = "$ticket" ]; then
           state="$(worktree_state "$wt")"
           if [ -n "$include_clean" ] || [ "$state" != "clean" ]; then
             printf '%s\t%s\t%s\t%s\n' "$repo_name" "$wt" "$br" "$state"

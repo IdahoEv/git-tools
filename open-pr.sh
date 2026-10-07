@@ -31,6 +31,8 @@ while [ -h "$_src" ]; do
   [ "${_src#/}" = "$_src" ] && _src="$_dir/$_src"
 done
 SCRIPT_DIR="$(cd -P "$(dirname "$_src")" && pwd)"
+# shellcheck source=lib/repo-facts.sh
+. "$SCRIPT_DIR/lib/repo-facts.sh"
 # Provider lookup (first dir containing <name>.sh wins):
 #   1. $OPEN_PR_PROVIDER_DIR (explicit override)
 #   2. <main-repo-root>/.git-tools/open-pr-providers  (per-repo)
@@ -83,9 +85,17 @@ command -v gh >/dev/null || die "gh CLI not found"
 
 branch="$(git branch --show-current)"
 [ -n "$branch" ] || die "not on a branch (detached HEAD)"
-case "$branch" in
-  main|master|development) die "refusing to open a PR from $branch" ;;
-esac
+# Refuse to ship from the repo's actual default branch, whatever it's called —
+# the hardcoded main|master|development triple missed any other name. Keep
+# those as a fallback for when the default can't be resolved.
+_default="$(gt::default_branch || true)"
+if [ -n "$_default" ]; then
+  [ "$branch" = "$_default" ] && die "refusing to open a PR from $branch (the default branch)"
+else
+  case "$branch" in
+    main|master|development) die "refusing to open a PR from $branch" ;;
+  esac
+fi
 
 # ---- provider ---------------------------------------------------------------
 # Reviewer/bot wiring and this environment's PR title/body/branch conventions

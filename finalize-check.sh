@@ -23,7 +23,8 @@
 #   pr_merge_commit=<sha>
 #   pr_head_oid=<sha>
 #   head_oid=<sha>              (local tip)
-#   head_matches=yes|no|unknown (local tip == PR head)
+#   head_matches=same|behind|ahead|diverged|unknown
+#                               (local tip's relationship to the PR head)
 #   merged=yes|no|unknown       (branch is an ancestor of origin/<base>)
 #   base_worktree=<path>        (empty if not found)
 #   worktree=<path>             (the worktree being finalized)
@@ -36,9 +37,12 @@
 #   not-merged     a PR exists but hasn't merged.
 #   squash-merged  PR says MERGED but the branch isn't an ancestor (normal for
 #                  squash/rebase merges) — caller should confirm before deleting.
-#   local-commits  PR merged, but the local tip is ahead of the PR head: there
-#                  is work here the PR never contained. Caller must stop.
-#   unknown        couldn't determine (no gh, not the right host, no base).
+#   local-commits  PR merged, but the local branch is ahead of or diverged from
+#                  the PR head: there is work here the PR never contained.
+#                  Caller must stop. (A branch merely *behind* the PR head is a
+#                  stale worktree with nothing to lose — that stays `ready`.)
+#   unknown        couldn't determine (no gh/jq, not the right host, no base,
+#                  or the PR-head commit isn't available locally).
 #
 # Exit codes: 0 always when it could inspect the repo (read `verdict`, not $?);
 #             1 usage/precondition error (not a repo, detached HEAD).
@@ -89,14 +93,21 @@ base="$(gt::default_branch "$dir" || true)"
 # than acting on.
 pr_number="" pr_state="none" pr_merge_commit="" pr_head_oid=""
 if command -v gh >/dev/null && command -v jq >/dev/null; then
-  pr_json="$(cd "$worktree" && gh pr list --head "$branch" --state all \
-    --json number,state,mergedAt,mergeCommit,headRefOid \
-    --jq 'sort_by(.number) | last // empty' 2>/dev/null || true)"
-  if [ -n "$pr_json" ]; then
-    pr_number="$(printf '%s' "$pr_json"      | jq -r '.number // empty')"
-    pr_state="$(printf '%s' "$pr_json"       | jq -r '.state // "unknown"')"
-    pr_merge_commit="$(printf '%s' "$pr_json"| jq -r '.mergeCommit.oid // empty')"
-    pr_head_oid="$(printf '%s' "$pr_json"    | jq -r '.headRefOid // empty')"
+  # Distinguish "query succeeded, no PR" from "query failed": both yield an
+  # empty string, but conflating them would report an auth/network/wrong-repo
+  # error as verdict=no-pr — i.e. "nothing to finalize", which reads like a
+  # clean answer. Only a zero exit may leave pr_state at "none".
+  if pr_json="$(cd "$worktree" && gh pr list --head "$branch" --state all \
+      --json number,state,mergedAt,mergeCommit,headRefOid \
+      --jq 'sort_by(.number) | last // empty' 2>/dev/null)"; then
+    if [ -n "$pr_json" ]; then
+      pr_number="$(printf '%s' "$pr_json"      | jq -r '.number // empty')"
+      pr_state="$(printf '%s' "$pr_json"       | jq -r '.state // "unknown"')"
+      pr_merge_commit="$(printf '%s' "$pr_json"| jq -r '.mergeCommit.oid // empty')"
+      pr_head_oid="$(printf '%s' "$pr_json"    | jq -r '.headRefOid // empty')"
+    fi
+  else
+    pr_state="unknown"
   fi
 else
   pr_state="unknown"
@@ -119,10 +130,37 @@ fi
 # ---- local tip vs PR head ---------------------------------------------------
 # The PR only proves its *remote head* merged. Commits added locally after the
 # last push are invisible to it and would be destroyed by a branch delete.
+#
+# What matters is ANCESTRY, not OID equality: a mismatch alone doesn't mean
+# local work exists. If someone else pushed the final commit and this worktree
+# never pulled, the local tip is *behind* the PR head — nothing to lose, and
+# treating it as local work would block cleanup for no reason.
+#   same     local tip == PR head
+#   behind   local tip is an ancestor of the PR head (stale worktree, safe)
+#   ahead    PR head is an ancestor of local tip (real local-only commits)
+#   diverged both sides have commits the other lacks (also unsafe)
+#   unknown  the PR-head object isn't present locally, so ancestry is unprovable
 head_oid="$(git -C "$worktree" rev-parse HEAD)"
 head_matches="unknown"
 if [ -n "$pr_head_oid" ]; then
-  [ "$head_oid" = "$pr_head_oid" ] && head_matches="yes" || head_matches="no"
+  if [ "$head_oid" = "$pr_head_oid" ]; then
+    head_matches="same"
+  elif ! git -C "$worktree" cat-file -e "${pr_head_oid}^{commit}" 2>/dev/null; then
+    # Not fetched (or garbage-collected after a merged branch was deleted).
+    # Try once, then give up rather than guessing.
+    git -C "$worktree" fetch --quiet origin "$pr_head_oid" 2>/dev/null || true
+    git -C "$worktree" cat-file -e "${pr_head_oid}^{commit}" 2>/dev/null \
+      || head_matches="unknown"
+  fi
+  if [ "$head_matches" = "unknown" ] && git -C "$worktree" cat-file -e "${pr_head_oid}^{commit}" 2>/dev/null; then
+    if git -C "$worktree" merge-base --is-ancestor "$head_oid" "$pr_head_oid" 2>/dev/null; then
+      head_matches="behind"
+    elif git -C "$worktree" merge-base --is-ancestor "$pr_head_oid" "$head_oid" 2>/dev/null; then
+      head_matches="ahead"
+    else
+      head_matches="diverged"
+    fi
+  fi
 fi
 
 # ---- base worktree ----------------------------------------------------------
@@ -140,7 +178,10 @@ fi
 if   [ -z "$pr_number" ] && [ "$pr_state" != "unknown" ]; then verdict="no-pr"
 elif [ "$pr_state" = "unknown" ] || [ "$merged" = "unknown" ]; then verdict="unknown"
 elif [ "$pr_state" != "MERGED" ]; then verdict="not-merged"
-elif [ "$head_matches" = "no" ]; then verdict="local-commits"
+# Only ahead/diverged mean there is local work the PR never contained. `behind`
+# is a stale worktree with nothing to lose, so it's safe to clean up.
+elif [ "$head_matches" = "ahead" ] || [ "$head_matches" = "diverged" ]; then verdict="local-commits"
+elif [ "$head_matches" = "unknown" ]; then verdict="unknown"
 elif [ "$merged" = "no" ]; then verdict="squash-merged"
 elif [ "$merged" = "yes" ]; then verdict="ready"
 else verdict="unknown"

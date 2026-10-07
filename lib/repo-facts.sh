@@ -1,10 +1,14 @@
 #!/usr/bin/env bash
 # lib/repo-facts.sh — shared, read-only facts about a repo/branch.
 #
-# Sourced by start-ticket.sh, open-pr.sh, sibling-worktrees.sh, and
-# finalize-check.sh so the conventions below live in exactly one place. These
-# were previously restated in prose inside .claude/commands/*.md, which meant
-# the model re-derived them (and re-ran the probe commands) on every invocation.
+# Sourced by open-pr.sh, sibling-worktrees.sh, and finalize-check.sh so the
+# conventions below live in exactly one place. These were previously restated in
+# prose inside .claude/commands/*.md, which meant the model re-derived them (and
+# re-ran the probe commands) on every invocation.
+#
+# start-ticket.sh does NOT source this: it resolves a ticket id from its
+# argument and a branch name from its provider, so it has no use for either
+# helper. Don't wire it up just for symmetry.
 #
 # Everything here is pure inspection: no network beyond the host CLI fallback
 # in gt::default_branch, no writes, no side effects.
