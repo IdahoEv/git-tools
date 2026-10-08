@@ -215,8 +215,14 @@ OSA
 
 # ---- background session (Claude Code agent view) -----------------------------
 # Starts `claude --bg` in the worktree so the session shows up as a row in
-# `claude agents`, named "Is<n> <slug>" (hyphens → spaces, START_TICKET_BG_MAXLEN
-# long). Because the worktree already exists (worktree-manager.sh made it),
+# `claude agents`, named "[PLAN] Is<n> <slug>" (hyphens → spaces,
+# START_TICKET_BG_MAXLEN long). The "[PLAN]" prefix is the ticket's workflow
+# phase; the session advances it itself (agent-phase.sh) as the ticket moves
+# plan → wip → review → merged → done, giving the agent view a third state axis
+# beyond `status` (idle/busy) and `state` (working/blocked/done). It starts at
+# PLAN because the bg launcher submits the kickoff immediately in plan mode, so
+# the session's first act is always to propose rather than edit.
+# Because the worktree already exists (worktree-manager.sh made it),
 # Claude Code uses it as-is rather than creating its own under .claude/worktrees/,
 # so .worktree-sync seeding is preserved and /finalize's cleanup still applies.
 # Unlike the iTerm launcher, the kickoff is submitted immediately; the default
@@ -227,6 +233,9 @@ open_bg() {  # <worktree> <kickoff>
   command -v claude >/dev/null || die "claude CLI not found (needed by the bg launcher)"
   local branch; branch="$(git -C "$wt" branch --show-current 2>/dev/null || basename "$wt")"
   local label; label="$(make_label "$branch" "${START_TICKET_BG_MAXLEN:-70}" pretty)"
+  # The phase prefix is budgeted outside make_label's maxlen: truncating the
+  # slug is fine, truncating "[PLAN]" would defeat the point of the label.
+  label="[PLAN] $label"
   local perm; perm="$(setting bg_permission_mode START_TICKET_BG_PERMISSION_MODE plan)"
   local args=(--bg --name "$label")
   [ "$perm" = "default" ] || args+=(--permission-mode "$perm")

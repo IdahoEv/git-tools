@@ -253,6 +253,14 @@ if [ "$review" != "none" ]; then
   esac
 fi
 
+# ---- agent-view phase --------------------------------------------------------
+# The PR exists and reviews are dispatched, so this ticket is now in review.
+# Stamped here rather than left to /open-pr's prose because it's deterministic
+# and should hold even when the command is run by hand. No-ops outside a
+# background session, and never fails the ship — the PR is already open by now,
+# so aborting over a display label would be strictly worse than a stale one.
+"$SCRIPT_DIR/agent-phase.sh" REVIEW >/dev/null 2>&1 || true
+
 printf 'pr_number=%s\npr_url=%s\npr_action=%s\n' "$pr_number" "$pr_url" "$pr_action"
 # Reported so /open-pr can describe reviews accurately without re-reading the
 # conf: under "auto" the bots fire on PR open and nothing was dispatched here.

@@ -29,6 +29,9 @@
 #   base_worktree=<path>        (empty if not found)
 #   worktree=<path>             (the worktree being finalized)
 #   verdict=ready|not-merged|no-pr|local-commits|squash-merged|unknown
+#   agent_phase=MERGED|REVIEW|  the agent-view phase this verdict implies, for
+#               <empty>         the caller to pass to agent-phase.sh. Empty when
+#                               the verdict doesn't justify moving the label.
 #
 # `verdict` is the one-line summary a caller can branch on:
 #   ready          PR merged AND branch is an ancestor of origin/<base> AND
@@ -193,5 +196,21 @@ printf 'pr_number=%s\npr_state=%s\npr_merge_commit=%s\npr_head_oid=%s\n' \
   "$pr_number" "$pr_state" "$pr_merge_commit" "$pr_head_oid"
 printf 'head_oid=%s\nhead_matches=%s\nmerged=%s\n' \
   "$head_oid" "$head_matches" "$merged"
-printf 'base_worktree=%s\nworktree=%s\nverdict=%s\n' \
-  "$base_worktree" "$worktree" "$verdict"
+# ---- implied agent-view phase -----------------------------------------------
+# Which workflow phase the agent-view row should show, derived from the verdict
+# so /finalize doesn't re-reason about it. This script stays read-only (it
+# reports, it does not stamp) — the caller runs agent-phase.sh with this value.
+#
+# DONE is deliberately absent: it means "/finalize has finished and the session
+# is safe to kill", which is only true after cleanup actually ran, and cleanup
+# is the caller's job. Verdicts that mean "stop and look" (local-commits,
+# unknown, no-pr) leave this empty rather than guessing — a wrong label on a
+# branch that needs attention is worse than no change.
+case "$verdict" in
+  ready|squash-merged) agent_phase="MERGED" ;;
+  not-merged)          agent_phase="REVIEW" ;;
+  *)                   agent_phase="" ;;
+esac
+
+printf 'base_worktree=%s\nworktree=%s\nverdict=%s\nagent_phase=%s\n' \
+  "$base_worktree" "$worktree" "$verdict" "$agent_phase"
