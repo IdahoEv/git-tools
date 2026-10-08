@@ -40,6 +40,17 @@ set -euo pipefail
 
 die() { printf 'sibling-worktrees: %s\n' "$*" >&2; exit 1; }
 
+# ---- resolve our own dir (following symlinks) -----------------------------
+_src="${BASH_SOURCE[0]}"
+while [ -h "$_src" ]; do
+  _dir="$(cd -P "$(dirname "$_src")" && pwd)"
+  _src="$(readlink "$_src")"
+  [ "${_src#/}" = "$_src" ] && _src="$_dir/$_src"
+done
+SCRIPT_DIR="$(cd -P "$(dirname "$_src")" && pwd)"
+# shellcheck source=lib/repo-facts.sh
+. "$SCRIPT_DIR/lib/repo-facts.sh"
+
 # ---- args -------------------------------------------------------------------
 ticket="" branch="" root="" include_clean="" repos_csv=""
 while [ $# -gt 0 ]; do
@@ -57,22 +68,12 @@ done
 git rev-parse --is-inside-work-tree >/dev/null 2>&1 || die "not inside a git repo"
 
 # ---- ticket id --------------------------------------------------------------
-ticket_from_branch() {  # <branch> → id, or nothing
-  local b="$1"
-  # Shortcut first: an sc- id is unambiguous, while the GitHub form is just
-  # "leading digits" and would also match a branch like "2-sc-5/foo".
-  if [[ "$b" =~ .*sc-([0-9]+) ]]; then
-    printf '%s' "${BASH_REMATCH[1]}"
-  elif [[ "$b" =~ ^([1-9][0-9]*)- ]]; then
-    printf '%s' "${BASH_REMATCH[1]}"
-  fi
-  return 0
-}
-
+# Convention lives in lib/repo-facts.sh (gt::ticket_from_branch) so finalize-check.sh
+# and the open-pr providers parse branches identically.
 if [ -z "$ticket" ]; then
   [ -n "$branch" ] || branch="$(git branch --show-current)"
   [ -n "$branch" ] || die "not on a branch (detached HEAD) — pass --ticket"
-  ticket="$(ticket_from_branch "$branch")"
+  ticket="$(gt::ticket_from_branch "$branch")"
 fi
 [ -n "$ticket" ] || die "can't parse a ticket id from branch '${branch:-?}' — pass --ticket"
 [[ "$ticket" =~ ^[1-9][0-9]*$ ]] || die "ticket id must be a positive integer (got '$ticket')"
@@ -110,17 +111,7 @@ fi
 # work — a worktree wrongly shown as `ahead` costs a confirmation, never a
 # silently skipped repo. Erring that direction is deliberate.
 base_ref_for() {  # <worktree> → refs/remotes/origin/<base>, or nothing
-  local wt="$1" b
-  b="$(git -C "$wt" symbolic-ref --short refs/remotes/origin/HEAD 2>/dev/null || true)"
-  if [ -n "$b" ] && git -C "$wt" rev-parse --verify --quiet "$b" >/dev/null; then
-    printf '%s' "$b"; return 0
-  fi
-  for b in development main master; do
-    if git -C "$wt" rev-parse --verify --quiet "origin/$b" >/dev/null; then
-      printf 'origin/%s' "$b"; return 0
-    fi
-  done
-  return 0
+  gt::default_branch_ref "$1" || true
 }
 
 worktree_state() {  # <worktree> → dirty | ahead | dirty+ahead | clean
@@ -157,7 +148,7 @@ for repo in "${candidates[@]}"; do
       "worktree "*) wt="${line#worktree }"; br="" ;;
       "branch "*)   br="${line#branch }"; br="${br#refs/heads/}" ;;
       "")
-        if [ -n "$wt" ] && [ -n "$br" ] && [ "$(ticket_from_branch "$br")" = "$ticket" ]; then
+        if [ -n "$wt" ] && [ -n "$br" ] && [ "$(gt::ticket_from_branch "$br")" = "$ticket" ]; then
           state="$(worktree_state "$wt")"
           if [ -n "$include_clean" ] || [ "$state" != "clean" ]; then
             printf '%s\t%s\t%s\t%s\n' "$repo_name" "$wt" "$br" "$state"

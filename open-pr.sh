@@ -31,6 +31,8 @@ while [ -h "$_src" ]; do
   [ "${_src#/}" = "$_src" ] && _src="$_dir/$_src"
 done
 SCRIPT_DIR="$(cd -P "$(dirname "$_src")" && pwd)"
+# shellcheck source=lib/repo-facts.sh
+. "$SCRIPT_DIR/lib/repo-facts.sh"
 # Provider lookup (first dir containing <name>.sh wins):
 #   1. $OPEN_PR_PROVIDER_DIR (explicit override)
 #   2. <main-repo-root>/.git-tools/open-pr-providers  (per-repo)
@@ -83,9 +85,17 @@ command -v gh >/dev/null || die "gh CLI not found"
 
 branch="$(git branch --show-current)"
 [ -n "$branch" ] || die "not on a branch (detached HEAD)"
-case "$branch" in
-  main|master|development) die "refusing to open a PR from $branch" ;;
-esac
+# Refuse to ship from the repo's actual default branch, whatever it's called —
+# the hardcoded main|master|development triple missed any other name. Keep
+# those as a fallback for when the default can't be resolved.
+_default="$(gt::default_branch || true)"
+if [ -n "$_default" ]; then
+  [ "$branch" = "$_default" ] && die "refusing to open a PR from $branch (the default branch)"
+else
+  case "$branch" in
+    main|master|development) die "refusing to open a PR from $branch" ;;
+  esac
+fi
 
 # ---- provider ---------------------------------------------------------------
 # Reviewer/bot wiring and this environment's PR title/body/branch conventions
@@ -192,6 +202,43 @@ fi
 
 pr_url="$(gh pr view "$pr_number" --json url --jq '.url')"
 
+# ---- title self-check -------------------------------------------------------
+# This script applied the prefix (provider::pr_title), so it is also the thing
+# that can tell whether the result is right — /open-pr used to read the title
+# back and reason about it by hand, one round-trip per ship. A doubled prefix
+# means the caller's draft already carried one; provider::pr_title is
+# idempotent for its OWN dialect but can't catch a foreign one (the
+# `sc-73237: Is73237: …` case). Repair it here and say so.
+pr_title_now="$(gh pr view "$pr_number" --json title --jq '.title')"
+pr_title_fixed=""
+if [ -n "$create_pr" ] && [ -n "${issue:-}" ]; then
+  expected="$(provider::pr_title "$issue" "")"
+  expected="${expected% }"                     # bare prefix, e.g. "Is42:" / "sc-42:"
+  if [ -n "$expected" ]; then
+    # Strip every leading ticket prefix — this provider's own (repeated) AND a
+    # foreign dialect's. Both dialects git-tools creates are matched, because
+    # the failure mode that reached production was a cross-dialect double
+    # (`sc-73237: Is73237: …`), which an idempotency check on one dialect alone
+    # cannot see. Then re-apply exactly one.
+    rest="$pr_title_now" n=0
+    while :; do
+      if [ "${rest#"$expected"}" != "$rest" ]; then
+        rest="${rest#"$expected"}"
+      elif [[ "$rest" =~ ^(Is[0-9]+|sc-[0-9]+):[[:space:]] ]]; then
+        rest="${rest#"${BASH_REMATCH[1]}":}"
+      else
+        break
+      fi
+      rest="${rest# }"; n=$((n + 1))
+    done
+    if [ "$n" -gt 1 ] || { [ "$n" -eq 1 ] && [ "${pr_title_now#"$expected"}" = "$pr_title_now" ]; }; then
+      gh pr edit "$pr_number" --title "$expected $rest" >/dev/null
+      pr_title_fixed="$pr_title_now"
+      pr_title_now="$expected $rest"
+    fi
+  fi
+fi
+
 # ---- reviews ----------------------------------------------------------------
 if [ "$review" != "none" ]; then
   # trigger_mode seam: "manual" providers dispatch their review triggers here
@@ -206,4 +253,18 @@ if [ "$review" != "none" ]; then
   esac
 fi
 
+# ---- agent-view phase --------------------------------------------------------
+# The PR exists and reviews are dispatched, so this ticket is now in review.
+# Stamped here rather than left to /open-pr's prose because it's deterministic
+# and should hold even when the command is run by hand. No-ops outside a
+# background session, and never fails the ship — the PR is already open by now,
+# so aborting over a display label would be strictly worse than a stale one.
+"$SCRIPT_DIR/agent-phase.sh" REVIEW >/dev/null 2>&1 || true
+
 printf 'pr_number=%s\npr_url=%s\npr_action=%s\n' "$pr_number" "$pr_url" "$pr_action"
+# Reported so /open-pr can describe reviews accurately without re-reading the
+# conf: under "auto" the bots fire on PR open and nothing was dispatched here.
+printf 'provider=%s\ntrigger_mode=%s\npr_title=%s\n' \
+  "$provider" "${PROVIDER_TRIGGER_MODE:-manual}" "$pr_title_now"
+[ -n "$pr_title_fixed" ] && printf 'pr_title_repaired_from=%s\n' "$pr_title_fixed"
+exit 0

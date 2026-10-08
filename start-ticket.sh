@@ -215,8 +215,14 @@ OSA
 
 # ---- background session (Claude Code agent view) -----------------------------
 # Starts `claude --bg` in the worktree so the session shows up as a row in
-# `claude agents`, named "Is<n> <slug>" (hyphens → spaces, START_TICKET_BG_MAXLEN
-# long). Because the worktree already exists (worktree-manager.sh made it),
+# `claude agents`, named "[PLAN] Is<n> <slug>" (hyphens → spaces,
+# START_TICKET_BG_MAXLEN long). The "[PLAN]" prefix is the ticket's workflow
+# phase; the session advances it itself (agent-phase.sh) as the ticket moves
+# plan → wip → review → merged → done, giving the agent view a third state axis
+# beyond `status` (idle/busy) and `state` (working/blocked/done). It starts at
+# PLAN because the bg launcher submits the kickoff immediately in plan mode, so
+# the session's first act is always to propose rather than edit.
+# Because the worktree already exists (worktree-manager.sh made it),
 # Claude Code uses it as-is rather than creating its own under .claude/worktrees/,
 # so .worktree-sync seeding is preserved and /finalize's cleanup still applies.
 # Unlike the iTerm launcher, the kickoff is submitted immediately; the default
@@ -227,6 +233,9 @@ open_bg() {  # <worktree> <kickoff>
   command -v claude >/dev/null || die "claude CLI not found (needed by the bg launcher)"
   local branch; branch="$(git -C "$wt" branch --show-current 2>/dev/null || basename "$wt")"
   local label; label="$(make_label "$branch" "${START_TICKET_BG_MAXLEN:-70}" pretty)"
+  # The phase prefix is budgeted outside make_label's maxlen: truncating the
+  # slug is fine, truncating "[PLAN]" would defeat the point of the label.
+  label="[PLAN] $label"
   local perm; perm="$(setting bg_permission_mode START_TICKET_BG_PERMISSION_MODE plan)"
   local args=(--bg --name "$label")
   [ "$perm" = "default" ] || args+=(--permission-mode "$perm")
@@ -324,6 +333,20 @@ branch="$(git -C "$wt" branch --show-current)"
 declare -f provider::post_worktree >/dev/null && provider::post_worktree "$id" "$wt"
 provider::mark_in_progress "$id" || echo "start-ticket: WARN mark_in_progress failed" >&2
 
+# mark_in_progress is best-effort and some tracker CLIs fail while exiting 0, so
+# read the state back here rather than making the caller verify. ticket_state is
+# what the tracker ACTUALLY reports; ticket_in_progress says whether that counts
+# as started. ticket_in_progress=no means /start must repair it (Shortcut: via
+# the MCP tools — its CLI's state-set is broken).
+ticket_state="" ticket_in_progress="unknown"
+if declare -f provider::read_state >/dev/null; then
+  if ticket_state="$(provider::read_state "$id")"; then
+    ticket_in_progress="yes"
+  else
+    ticket_in_progress="no"
+  fi
+fi
+
 # ---- kickoff ---------------------------------------------------------
 _tmp="${TMPDIR:-/tmp}"; kickoff="${_tmp%/}/${repo_name}-kickoff-${id}.md"
 {
@@ -342,6 +365,9 @@ _tmp="${TMPDIR:-/tmp}"; kickoff="${_tmp%/}/${repo_name}-kickoff-${id}.md"
   fi
 } > "$kickoff"
 
-printf 'worktree=%s\nkickoff=%s\n' "$wt" "$kickoff"   # stdout: parseable by callers
+# stdout: parseable by callers
+printf 'worktree=%s\nkickoff=%s\nbranch=%s\nprovider=%s\n' "$wt" "$kickoff" "$branch" "$provider"
+printf 'ticket_state=%s\nticket_in_progress=%s\nticket_parent=%s\n' \
+  "$ticket_state" "$ticket_in_progress" "$ST_PARENT"
 [ "$mode" = "no-tab" ] && exit 0
 launch_session "$wt" "$kickoff"
